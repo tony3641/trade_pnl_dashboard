@@ -1,6 +1,37 @@
 # Progress Summary
 
-## Session Highlights (This Full Session)
+## Session Highlights - QFX Parser Implementation
+
+### New: QFX/OFX File Format Support
+- Created `src/io/load_qfx.py`: regex-based SGML parser for Interactive Brokers QFX investment statements.
+- Parses all transaction types:
+  - `<BUYOPT>` / `<SELLOPT>` → `"Buy"` / `"Sell"` with full option fields (underlying, expiry, strike, right).
+  - `<INCOME>` (dividends) → `"Dividend"` (included in daily PnL).
+  - `<INVBANKTRAN>` (fees/refunds) → `"Other Fee"` (excluded from daily PnL but counted in initial capital).
+- Security lookup (`<SECLIST>`) maps CONID → OCC option symbol for seamless parsing into existing option-parsing pipeline.
+- `<INVBAL>` extraction: final cash + equity for auto-calculating starting capital.
+
+### Multi-File Upload & Deduplication
+- Updated `app.py` file uploader to accept both `.csv` and `.qfx` with `accept_multiple_files=True`.
+- Merged frames are deduplicated on `(activity_date, account_id, symbol, quantity, net_amount)` to handle cross-format overlap.
+- `source_row` is re-numbered after merge for clean enriched output.
+
+### Initial Capital Auto-Inference
+- Formula: `Initial Capital = Final Balance − Total Period P&L` (includes all cash flows: trades, dividends, fees, refunds).
+- When a QFX file is loaded, sidebar displays:
+  - Detected cash balance, stock value, total account value.
+  - Estimated starting capital (computed from INVBAL − period sum of all net amounts).
+- Initial capital pre-fills from this estimate but remains user-overridable.
+- Fee/refund pairs cancel naturally in the sum; any net unrefunded fees are correctly deducted.
+
+### Validation
+- Full QFX test: 817 transactions parsed (401 Buy, 396 Sell, 18 Fees, 2 Dividends).
+- 0DTE spread verification: Jan 2 day shows short legs (+$0.50 premium) + stop-loss buybacks (−$2–$4 fill) = **−$1,861.16 net loss** ✓
+- Dividends: 2 entries (BIL: $117.79, $104.54) included in PnL ✓
+- INVBAL: $5,601.49 cash + $39,379.40 stock = $44,980.89 ✓
+- Auto-calculated initial capital: $42,486.38 ✓
+
+## Previous Session Highlights (Cumulative PnL & Risk Tabs)
 - Implemented account-vs-benchmark enhancements across curve and risk pages, plus lazy benchmark loading for better startup responsiveness.
 - Added richer chart hover payloads for both account and SPX curves.
 - Added SPX period performance delta in Risk metrics.

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
 
 from src.domain.pnl_engine import build_realized_pnl
 from src.io.load_csv import load_transactions_csv
+from src.io.load_qfx import InvBalance, load_transactions_qfx
 from src.io.load_spx import load_spx_daily
 from src.ui.tab_calendar import render_calendar_tab
 from src.ui.tab_curve import render_curve_tab
@@ -20,29 +22,93 @@ st.caption("Realized PnL uses broker Net Amount. Other Fee is excluded from PnL 
 
 with st.sidebar:
     st.header("Data Source")
-    uploaded = st.file_uploader("Upload YTD CSV", type=["csv"])
+    uploaded_files = st.file_uploader(
+        "Upload CSV or QFX (one or both)",
+        type=["csv", "qfx"],
+        accept_multiple_files=True,
+    )
     st.markdown("or")
-    path_input = st.text_input("Load from local path")
+    path_input = st.text_input("Load from local path (CSV or QFX)")
 
 
-def _load_input():
-    if uploaded is not None:
-        try:
-            return load_transactions_csv(uploaded)
-        except ValueError as exc:
-            st.error(str(exc))
-            return None
+# _DEDUP_KEY: columns used to identify duplicate rows when merging CSV + QFX
+_DEDUP_KEY = ["activity_date", "account_id", "symbol", "quantity", "net_amount"]
+
+
+def _load_single_file(f) -> tuple[Optional[pd.DataFrame], Optional[InvBalance]]:
+    """Load one uploaded file (CSV or QFX). Returns (df, invbal_or_None)."""
+    name = getattr(f, "name", "") or ""
+    ext = Path(name).suffix.lower()
+    try:
+        if ext == ".qfx":
+            df, invbal = load_transactions_qfx(f)
+            return df, invbal
+        else:
+            df = load_transactions_csv(f)
+            return df, None
+    except ValueError as exc:
+        st.error(f"{name}: {exc}")
+        return None, None
+
+
+def _load_single_path(p: Path) -> tuple[Optional[pd.DataFrame], Optional[InvBalance]]:
+    """Load a file from a local path (CSV or QFX)."""
+    ext = p.suffix.lower()
+    try:
+        if ext == ".qfx":
+            df, invbal = load_transactions_qfx(p)
+            return df, invbal
+        else:
+            df = load_transactions_csv(p)
+            return df, None
+    except ValueError as exc:
+        st.error(f"{p.name}: {exc}")
+        return None, None
+
+
+def _merge_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Concatenate DataFrames and drop obvious duplicates."""
+    merged = pd.concat(frames, ignore_index=True)
+    # Keep first occurrence of any (date, account, symbol, qty, net_amount) tuple
+    dup_cols = [c for c in _DEDUP_KEY if c in merged.columns]
+    if dup_cols:
+        merged = merged.drop_duplicates(subset=dup_cols, keep="first")
+    merged = merged.sort_values("activity_date").reset_index(drop=True)
+    # Re-number source_row after merge
+    merged["source_row"] = range(1, len(merged) + 1)
+    return merged
+
+
+def _load_input() -> tuple[Optional[pd.DataFrame], Optional[InvBalance]]:
+    """Load all uploaded files and/or local path, merge, return (df, invbal)."""
+    frames: list[pd.DataFrame] = []
+    invbal: Optional[InvBalance] = None
+
+    # Uploaded files (may be multiple)
+    for f in (uploaded_files or []):
+        df, ib = _load_single_file(f)
+        if df is not None and not df.empty:
+            frames.append(df)
+        if ib is not None:
+            invbal = ib  # last QFX wins (typically there's only one)
+
+    # Local path
     if path_input.strip():
-        csv_path = Path(path_input.strip())
-        if not csv_path.exists():
+        p = Path(path_input.strip())
+        if not p.exists():
             st.error("Path does not exist.")
-            return None
-        try:
-            return load_transactions_csv(csv_path)
-        except ValueError as exc:
-            st.error(str(exc))
-            return None
-    return None
+        else:
+            df, ib = _load_single_path(p)
+            if df is not None and not df.empty:
+                frames.append(df)
+            if ib is not None:
+                invbal = ib
+
+    if not frames:
+        return None, None
+
+    merged = _merge_frames(frames)
+    return merged, invbal
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -65,13 +131,37 @@ def _load_spx_for_period(daily_df: pd.DataFrame) -> pd.DataFrame:
             return pd.DataFrame(columns=["activity_date", "spx_close", "spx_return"])
 
 
-raw_df = _load_input()
+raw_df, qfx_invbal = _load_input()
 if raw_df is None:
-    st.info("Upload your YTD CSV in the sidebar to start.")
+    st.info("Upload your CSV or QFX file(s) in the sidebar to start.")
     st.stop()
 
+# Auto-compute initial capital from QFX INVBAL when a QFX file is loaded.
+# Formula: Initial Capital = Final Balance - Total Realized P&L over the period.
+# The user can always override this in the session state widget.
+_qfx_auto_capital: Optional[float] = None
+if qfx_invbal is not None:
+    # Sum ALL net_amounts (trades, dividends, fees, refunds) so that
+    # fee/refund pairs cancel out and any net unrefunded fees are included.
+    total_net_in_period = float(raw_df["net_amount"].fillna(0.0).sum())
+    _qfx_auto_capital = qfx_invbal.total - total_net_in_period
+    with st.sidebar:
+        st.divider()
+        st.markdown("**Account Balance (from QFX)**")
+        st.markdown(
+            f"Cash: `${qfx_invbal.cash:,.2f}`  \n"
+            f"Stock: `${qfx_invbal.stock_value:,.2f}`  \n"
+            f"Total: `${qfx_invbal.total:,.2f}`"
+        )
+        st.caption(
+            f"Estimated initial capital: **${_qfx_auto_capital:,.2f}**  \n"
+            "(Final balance − period P&L)"
+        )
+
 if "shared_initial_capital" not in st.session_state:
-    st.session_state["shared_initial_capital"] = 100000.0
+    st.session_state["shared_initial_capital"] = (
+        _qfx_auto_capital if _qfx_auto_capital is not None else 100000.0
+    )
 if "curve_spx_mode" not in st.session_state:
     st.session_state["curve_spx_mode"] = "Off"
 if "curve_range" not in st.session_state:

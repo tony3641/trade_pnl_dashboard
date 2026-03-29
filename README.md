@@ -22,9 +22,17 @@ streamlit run app.py
 - Risk metrics include Sharpe, Sortino, cycle stats, recovery, commission drag, SPX alpha/beta/correlation, SPX period return, and return delta vs SPX.
 - Context persistence on page switching (window, capital, SPX toggle, risk-free rate).
 
+## Data Input
+
+- **Supported formats**: Interactive Brokers CSV or QFX/OFX investment statements.
+- Upload one or both file types in sidebar, or provide a local file path.
+- Duplicate rows (same date, account, symbol, quantity, net amount) are automatically deduplicated when multiple files are uploaded.
+- QFX parsing automatically extracts account balance (`<INVBAL>`) and calculates estimated initial capital as: `Final Balance − Total Period P&L`.
+
+## Supported Transactions (QFX)
+
 ## Data Notes
 
-- Input: upload CSV in sidebar or provide local file path.
-- `Other Fee` is excluded from realized PnL totals.
+- `Other Fee` is excluded from realized PnL totals (but included in initial capital back-calculation).
 - SPX data uses Yahoo Finance (`^GSPC`) via `yfinance`.
 - SPX fetch is lazy (only when needed), shows a spinner, and uses a 15s timeout.

@@ -63,9 +63,9 @@ def _colorbar_ticktext(values: np.ndarray) -> list[str]:
 
 def _build_calendar_matrix(
     daily_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str], pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str], pd.DataFrame]:
     if daily_df.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), [], pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), [], pd.DataFrame()
 
     start = pd.to_datetime(daily_df["activity_date"].min())
     end = pd.to_datetime(daily_df["activity_date"].max())
@@ -78,6 +78,7 @@ def _build_calendar_matrix(
     merged = date_df.merge(daily_df, on="activity_date", how="left").fillna(0)
 
     merged["date_ts"] = pd.to_datetime(merged["activity_date"])
+    merged["date_str"] = merged["date_ts"].dt.strftime("%Y-%m-%d")
     merged["weekday"] = merged["date_ts"].dt.weekday
     merged["week_start"] = merged["date_ts"] - pd.to_timedelta(merged["weekday"], unit="D")
 
@@ -95,6 +96,11 @@ def _build_calendar_matrix(
         .reindex(columns=range(7), fill_value=0.0)
         .sort_index()
     )
+    pivot_date = (
+        merged.pivot(index="week_seq", columns="weekday", values="date_str")
+        .reindex(columns=range(7), fill_value="")
+        .sort_index()
+    )
 
     weekly_summary = (
         merged.groupby("week_seq", as_index=True)
@@ -102,6 +108,8 @@ def _build_calendar_matrix(
             weekly_pnl=("realized_pnl", "sum"),
             weekly_commission=("commission_spent", "sum"),
             weekly_options=("option_contracts_traded", "sum"),
+            week_start_date=("date_str", "first"),
+            week_end_date=("date_str", "last"),
         )
         .sort_index()
     )
@@ -127,13 +135,13 @@ def _build_calendar_matrix(
         axis=1,
     )
 
-    return weekday_pnl, weekday_commission, text_cells, week_labels, weekly_text
+    return weekday_pnl, weekday_commission, pivot_date, text_cells, week_labels, weekly_text
 
 
 def render_calendar_tab(daily_df: pd.DataFrame) -> None:
     st.subheader("Daily Realized PnL Calendar")
 
-    pnl_matrix, commission_matrix, text_matrix, week_labels, weekly_text = _build_calendar_matrix(daily_df)
+    pnl_matrix, commission_matrix, date_matrix, text_matrix, week_labels, weekly_text = _build_calendar_matrix(daily_df)
     if pnl_matrix.empty:
         st.info("No data available.")
         return
@@ -142,8 +150,18 @@ def render_calendar_tab(daily_df: pd.DataFrame) -> None:
     x_labels = [calendar.day_abbr[i] for i in range(7)]
     normalized_pnl = _normalize_diverging(pnl_matrix.values)
     normalized_weekly_pnl = _normalize_diverging(weekly_text[["weekly_pnl"]].values)
-    daily_customdata = np.dstack((pnl_matrix.values, commission_matrix.values))
-    weekly_customdata = np.dstack((weekly_text[["weekly_pnl"]].values, weekly_text[["weekly_commission"]].values))
+    # customdata layers: [0]=pnl, [1]=commission, [2]=date string
+    daily_customdata = np.dstack((
+        pnl_matrix.values,
+        commission_matrix.values,
+        date_matrix.values,
+    ))
+    weekly_customdata = np.dstack((
+        weekly_text[["weekly_pnl"]].values,
+        weekly_text[["weekly_commission"]].values,
+        weekly_text[["week_start_date"]].values,
+        weekly_text[["week_end_date"]].values,
+    ))
 
     fig = make_subplots(
         rows=1,
@@ -173,7 +191,7 @@ def render_calendar_tab(daily_df: pd.DataFrame) -> None:
                 "len": 0.6,
                 "x": 1.02,
             },
-            hovertemplate="PnL=%{customdata[0]:+.1f}<br>Commission=%{customdata[1]:.1f}<extra></extra>",
+            hovertemplate="%{customdata[2]}<br>PnL=%{customdata[0]:+.1f}<br>Commission=%{customdata[1]:.1f}<extra></extra>",
             hoverongaps=False,
             xgap=2,
             ygap=2,
@@ -202,7 +220,7 @@ def render_calendar_tab(daily_df: pd.DataFrame) -> None:
                 "len": 0.6,
                 "x": 1.1,
             },
-            hovertemplate="Weekly PnL=%{customdata[0]:+.1f}<br>Weekly Commission=%{customdata[1]:.1f}<extra></extra>",
+            hovertemplate="%{customdata[2]} ~ %{customdata[3]}<br>Weekly PnL=%{customdata[0]:+.1f}<br>Weekly Commission=%{customdata[1]:.1f}<extra></extra>",
             xgap=2,
             ygap=2,
         ),

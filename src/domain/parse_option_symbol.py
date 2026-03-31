@@ -45,6 +45,22 @@ def parse_occ_option_symbol(symbol: str) -> Optional[ParsedOption]:
     )
 
 
+def build_occ_symbol(
+    underlying: str, expiry: date, right: str, strike: float,
+) -> str:
+    """
+    Build a padded OCC option symbol (inverse of parse_occ_option_symbol).
+
+    Example: build_occ_symbol("SPXW", date(2026,2,2), "P", 6940.0)
+             → "SPXW  260202P06940000"
+    """
+    root = underlying.upper().ljust(6)
+    expiry_str = expiry.strftime("%y%m%d")
+    right_char = "P" if right.upper().startswith("P") else "C"
+    strike_int = int(round(strike * 1000))
+    return f"{root}{expiry_str}{right_char}{strike_int:08d}"
+
+
 def parse_expiry_from_description(description: str) -> Optional[date]:
     if not isinstance(description, str):
         return None

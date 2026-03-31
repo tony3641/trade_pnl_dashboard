@@ -68,6 +68,24 @@ def _calc_metrics(
     if view.empty:
         return {}
 
+    # Fill ALL business days between first and last date so that non-trading
+    # days (zero PnL, zero return) are properly included in Sharpe / Sortino
+    # and SPX alignment.  Without this, metrics are inflated because the
+    # series only contains days with trades.
+    all_bdays = pd.bdate_range(
+        start=view["activity_date"].min(),
+        end=view["activity_date"].max(),
+    )
+    full_cal = pd.DataFrame({"activity_date": all_bdays.date})
+    view = (
+        full_cal
+        .merge(view, on="activity_date", how="left")
+        .fillna({"realized_pnl": 0.0, "commission_spent": 0.0,
+                 "option_contracts_traded": 0, "trade_count": 0})
+        .sort_values("activity_date")
+        .reset_index(drop=True)
+    )
+
     rf_daily = annual_rf / 252.0
     pnl = view["realized_pnl"].astype(float)
     daily_returns = pnl / initial_capital

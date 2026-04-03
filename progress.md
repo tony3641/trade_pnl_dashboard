@@ -240,3 +240,9 @@
 
 ## Documentation
 - `README.md` has been aligned and condensed to a concise quick-start + current behavior summary.
+
+##  Added: color mapping, out-of-range transparency, and first-click window fix
+- Calendar heatmap colorscale changed to explicit red/gray/green to avoid yellow near zero.
+- Out-of-range dates in calendar (before first trade and after last trade) now remain transparent (NaN) instead of colored zero.
+- Added Custom date range in curve and risk tabs with start/end limits from earliest/latest closed-trade date.
+- Fixed radio window control to use key="ctx_shared_window" directly to eliminate one-click delay and stale-state bounce.

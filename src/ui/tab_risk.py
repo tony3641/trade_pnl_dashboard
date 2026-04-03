@@ -8,14 +8,24 @@ import pandas as pd
 import streamlit as st
 
 
-WINDOW_OPTIONS = ["1M", "3M", "YTD", "1Y", "All"]
+WINDOW_OPTIONS = ["1M", "3M", "YTD", "1Y", "All", "Custom"]
 
 
-def _filter_range(df: pd.DataFrame, label: str) -> pd.DataFrame:
+def _filter_range(df: pd.DataFrame, label: str, custom_start=None, custom_end=None) -> pd.DataFrame:
     if df.empty or label == "All":
         return df.sort_values("activity_date").reset_index(drop=True)
 
     last_date = df["activity_date"].max()
+    if label == "Custom":
+        c_start = custom_start if custom_start is not None else df["activity_date"].min()
+        c_end = custom_end if custom_end is not None else last_date
+        return (
+            df[(df["activity_date"] >= c_start) & (df["activity_date"] <= c_end)]
+            .copy()
+            .sort_values("activity_date")
+            .reset_index(drop=True)
+        )
+
     if label == "1M":
         start = last_date - timedelta(days=29)
     elif label == "3M":
@@ -232,9 +242,9 @@ def render_risk_tab(daily_df: pd.DataFrame, spx_df: pd.DataFrame | None = None) 
 
     saved_capital = float(st.session_state.get("ctx_shared_initial_capital", 100000.0))
     saved_rf = float(st.session_state.get("ctx_risk_annual_rf", 0.0))
-    saved_window = str(st.session_state.get("ctx_shared_window", "1M"))
-    if saved_window not in WINDOW_OPTIONS:
-        saved_window = "1M"
+    # Ensure the shared key holds a valid option before the widget renders.
+    if st.session_state.get("ctx_shared_window") not in WINDOW_OPTIONS:
+        st.session_state["ctx_shared_window"] = "1M"
 
     control_col1, control_col2, control_col3 = st.columns([1, 1, 1])
     with control_col1:
@@ -254,19 +264,34 @@ def render_risk_tab(daily_df: pd.DataFrame, spx_df: pd.DataFrame | None = None) 
             format="%.2f",
         )
     with control_col3:
-        range_label = st.radio("Window", WINDOW_OPTIONS, horizontal=True, index=WINDOW_OPTIONS.index(saved_window))
+        range_label = st.radio("Window", WINDOW_OPTIONS, horizontal=True, key="ctx_shared_window")
 
     st.session_state["ctx_shared_initial_capital"] = float(initial_capital)
     st.session_state["ctx_risk_annual_rf"] = float(annual_rf_pct)
     st.session_state["ctx_risk_window"] = range_label
-    st.session_state["ctx_shared_window"] = range_label
+    # ctx_shared_window is already updated automatically via key= on the radio.
     st.session_state["shared_initial_capital"] = float(initial_capital)
     st.session_state["risk_annual_rf"] = float(annual_rf_pct)
     st.session_state["risk_window"] = range_label
     st.session_state["shared_window"] = range_label
     st.session_state["curve_range"] = range_label
 
-    view = _filter_range(daily_df, range_label)
+    custom_start = None
+    custom_end = None
+    if range_label == "Custom":
+        data_min = daily_df["activity_date"].min()
+        data_max = daily_df["activity_date"].max()
+        saved_custom_start = st.session_state.get("ctx_custom_start_date", data_min)
+        saved_custom_end = st.session_state.get("ctx_custom_end_date", data_max)
+        date_col1, date_col2, _ = st.columns([1, 1, 1])
+        with date_col1:
+            custom_start = st.date_input("Start Date", value=saved_custom_start, min_value=data_min, max_value=data_max)
+        with date_col2:
+            custom_end = st.date_input("End Date", value=saved_custom_end, min_value=data_min, max_value=data_max)
+        st.session_state["ctx_custom_start_date"] = custom_start
+        st.session_state["ctx_custom_end_date"] = custom_end
+
+    view = _filter_range(daily_df, range_label, custom_start=custom_start, custom_end=custom_end)
     if view.empty:
         st.info("No data available for selected window.")
         return

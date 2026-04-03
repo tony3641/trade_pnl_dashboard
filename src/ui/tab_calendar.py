@@ -75,7 +75,16 @@ def _build_calendar_matrix(
 
     all_days = pd.date_range(start=start_week, end=end_week, freq="D")
     date_df = pd.DataFrame({"activity_date": all_days.date})
-    merged = date_df.merge(daily_df, on="activity_date", how="left").fillna(0)
+    merged = date_df.merge(daily_df, on="activity_date", how="left")
+
+    # Only zero-fill days within the actual data range; days outside stay NaN
+    # so they render transparent on the heatmap.
+    in_range_mask = (
+        (pd.to_datetime(merged["activity_date"]) >= start) &
+        (pd.to_datetime(merged["activity_date"]) <= end)
+    )
+    fill_cols = [c for c in merged.columns if c != "activity_date"]
+    merged.loc[in_range_mask, fill_cols] = merged.loc[in_range_mask, fill_cols].fillna(0)
 
     merged["date_ts"] = pd.to_datetime(merged["activity_date"])
     merged["date_str"] = merged["date_ts"].dt.strftime("%Y-%m-%d")
@@ -179,7 +188,7 @@ def render_calendar_tab(daily_df: pd.DataFrame) -> None:
             text=text_matrix.values,
             customdata=daily_customdata,
             texttemplate="%{text}",
-            colorscale="RdYlGn",
+            colorscale=[[0.0, "rgb(180,0,0)"], [0.5, "rgb(110,110,110)"], [1.0, "rgb(0,160,0)"]],
             zmin=-1,
             zmax=1,
             zmid=0,
@@ -208,7 +217,7 @@ def render_calendar_tab(daily_df: pd.DataFrame) -> None:
             text=weekly_text[["label"]].values,
             customdata=weekly_customdata,
             texttemplate="%{text}",
-            colorscale="RdYlGn",
+            colorscale=[[0.0, "rgb(180,0,0)"], [0.5, "rgb(110,110,110)"], [1.0, "rgb(0,160,0)"]],
             zmin=-1,
             zmax=1,
             zmid=0,

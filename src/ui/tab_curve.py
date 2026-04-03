@@ -9,7 +9,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 
-def _filter_range(df: pd.DataFrame, label: str) -> pd.DataFrame:
+def _filter_range(df: pd.DataFrame, label: str, custom_start=None, custom_end=None) -> pd.DataFrame:
     if df.empty or label == "All":
         filtered = df.copy().sort_values("activity_date").reset_index(drop=True)
         if filtered.empty:
@@ -24,16 +24,25 @@ def _filter_range(df: pd.DataFrame, label: str) -> pd.DataFrame:
         return pd.concat([pd.DataFrame([anchor_row]), filtered], ignore_index=True)
 
     last_date = df["activity_date"].max()
-    if label == "1M":
-        start = last_date - timedelta(days=29)
-    elif label == "3M":
-        start = last_date - timedelta(days=89)
-    elif label == "1Y":
-        start = last_date - timedelta(days=364)
+    if label == "Custom":
+        c_start = custom_start if custom_start is not None else df["activity_date"].min()
+        c_end = custom_end if custom_end is not None else last_date
+        filtered = (
+            df[(df["activity_date"] >= c_start) & (df["activity_date"] <= c_end)]
+            .copy()
+            .sort_values("activity_date")
+            .reset_index(drop=True)
+        )
     else:
-        start = pd.Timestamp(last_date.year, 1, 1).date()
-
-    filtered = df[df["activity_date"] >= start].copy().sort_values("activity_date").reset_index(drop=True)
+        if label == "1M":
+            start = last_date - timedelta(days=29)
+        elif label == "3M":
+            start = last_date - timedelta(days=89)
+        elif label == "1Y":
+            start = last_date - timedelta(days=364)
+        else:
+            start = pd.Timestamp(last_date.year, 1, 1).date()
+        filtered = df[df["activity_date"] >= start].copy().sort_values("activity_date").reset_index(drop=True)
     if filtered.empty:
         return filtered
 
@@ -88,10 +97,10 @@ def render_curve_tab(
 ) -> None:
     st.subheader("Return Curve")
 
-    range_options = ["1M", "3M", "YTD", "1Y", "All"]
-    saved_range = str(st.session_state.get("ctx_shared_window", "1M"))
-    if saved_range not in range_options:
-        saved_range = "1M"
+    range_options = ["1M", "3M", "YTD", "1Y", "All", "Custom"]
+    # Ensure the shared key holds a valid option before the widget renders.
+    if st.session_state.get("ctx_shared_window") not in range_options:
+        st.session_state["ctx_shared_window"] = "1M"
 
     saved_capital = float(st.session_state.get("ctx_shared_initial_capital", 100000.0))
 
@@ -102,7 +111,7 @@ def render_curve_tab(
 
     control_col1, control_col2, control_col3 = st.columns([1, 1, 1])
     with control_col1:
-        range_label = st.radio("Window", range_options, horizontal=True, index=range_options.index(saved_range))
+        range_label = st.radio("Window", range_options, horizontal=True, key="ctx_shared_window")
     with control_col2:
         initial_capital = st.number_input(
             "Initial Capital (USD)",
@@ -130,7 +139,7 @@ def render_curve_tab(
         show_spx_curve = spx_mode == "On"
 
     st.session_state["ctx_curve_range"] = range_label
-    st.session_state["ctx_shared_window"] = range_label
+    # ctx_shared_window is already updated automatically via key= on the radio.
     st.session_state["ctx_shared_initial_capital"] = float(initial_capital)
     st.session_state["ctx_curve_spx_mode"] = spx_mode
     st.session_state["shared_initial_capital"] = float(initial_capital)
@@ -139,7 +148,22 @@ def render_curve_tab(
     st.session_state["shared_window"] = range_label
     st.session_state["risk_window"] = range_label
 
-    view = _filter_range(daily_df, range_label)
+    custom_start = None
+    custom_end = None
+    if range_label == "Custom":
+        data_min = daily_df["activity_date"].min()
+        data_max = daily_df["activity_date"].max()
+        saved_custom_start = st.session_state.get("ctx_custom_start_date", data_min)
+        saved_custom_end = st.session_state.get("ctx_custom_end_date", data_max)
+        date_col1, date_col2, _ = st.columns([1, 1, 1])
+        with date_col1:
+            custom_start = st.date_input("Start Date", value=saved_custom_start, min_value=data_min, max_value=data_max)
+        with date_col2:
+            custom_end = st.date_input("End Date", value=saved_custom_end, min_value=data_min, max_value=data_max)
+        st.session_state["ctx_custom_start_date"] = custom_start
+        st.session_state["ctx_custom_end_date"] = custom_end
+
+    view = _filter_range(daily_df, range_label, custom_start=custom_start, custom_end=custom_end)
     if view.empty:
         st.info("No data available for selected range.")
         return

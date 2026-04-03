@@ -173,8 +173,8 @@ def _load_spx_for_period(daily_df: pd.DataFrame) -> pd.DataFrame:
                 daily_df["activity_date"].min(),
                 daily_df["activity_date"].max(),
             )
-        except Exception:
-            st.warning("SPX data could not be loaded within 15 seconds or encountered an error.")
+        except Exception as exc:
+            st.warning(f"SPX data could not be loaded: {exc}")
             return pd.DataFrame(columns=["activity_date", "spx_close", "spx_return"])
 
 

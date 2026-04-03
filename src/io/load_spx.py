@@ -13,24 +13,21 @@ def load_spx_daily(start_date: date, end_date: date) -> pd.DataFrame:
     fetch_start = start_date - timedelta(days=10)
     fetch_end = end_date + timedelta(days=2)
 
-    data = yf.download(
-        "^GSPC",
+    # Use Ticker.history() — more cloud-deployment friendly than yf.download().
+    ticker = yf.Ticker("^GSPC")
+    data = ticker.history(
         start=fetch_start.isoformat(),
         end=fetch_end.isoformat(),
         interval="1d",
-        progress=False,
-        auto_adjust=False,
-        threads=False,
-        timeout=15,
+        auto_adjust=True,
+        timeout=20,
     )
 
     if data is None or data.empty:
         return pd.DataFrame(columns=["activity_date", "spx_close", "spx_return"])
 
-    if isinstance(data.columns, pd.MultiIndex):
-        close = data["Close"].iloc[:, 0]
-    else:
-        close = data["Close"]
+    # Ticker.history() always returns a flat column index; "Close" is the adjusted close.
+    close = data["Close"].copy()
 
     frame = close.rename("spx_close").to_frame().reset_index()
     date_col = "Date" if "Date" in frame.columns else frame.columns[0]

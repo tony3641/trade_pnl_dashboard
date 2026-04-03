@@ -184,7 +184,7 @@ def render_curve_tab(
             mode="lines+markers",
             name="Account Equity Curve",
             line={"color": account_color, "width": 2.4},
-            marker={"color": account_color, "size": 6},
+            marker={"color": account_color, "size": 8},
             customdata=view[["cumulative_return", "equity_curve", "daily_gain"]].values,
             hovertemplate=(
                 "Date=%{x}<br>"
@@ -211,7 +211,7 @@ def render_curve_tab(
                         mode="lines+markers",
                         name="SPX (Normalized)",
                         line={"color": spx_color, "width": 2.2, "dash": "solid"},
-                        marker={"color": spx_color, "size": 5},
+                        marker={"color": spx_color, "size": 7},
                         customdata=spx_curve[["spx_close", "spx_day_change", "spx_cum_return"]].values,
                         hovertemplate=(
                             "Date=%{x}<br>"
@@ -234,7 +234,7 @@ def render_curve_tab(
                 x=expire_days["activity_date"],
                 y=expire_days["equity_curve"],
                 mode="markers",
-                marker={"size": 11, "symbol": "diamond", "color": "#0B3D91"},
+                marker={"size": 13, "symbol": "diamond", "color": "#0B3D91"},
                 name="Contains inferred expiry realization",
                 customdata=expire_days[
                     ["expire_inferred_contract_count", "expire_inferred_count", "expire_inferred_pnl"]
@@ -321,7 +321,11 @@ def render_curve_tab(
         side="right",
         secondary_y=True,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displayModeBar": False, "scrollZoom": False},
+    )
 
     cols = st.columns(3)
     cols[0].metric("Realized PnL", f"${view['realized_pnl'].sum():,.2f}")

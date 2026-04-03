@@ -246,3 +246,16 @@
 - Out-of-range dates in calendar (before first trade and after last trade) now remain transparent (NaN) instead of colored zero.
 - Added Custom date range in curve and risk tabs with start/end limits from earliest/latest closed-trade date.
 - Fixed radio window control to use key="ctx_shared_window" directly to eliminate one-click delay and stale-state bounce.
+
+## Mobile UI Optimization (New)
+- Added a responsive CSS block in `app.py` for `@media (max-width: 768px)`:
+  - `stHeader` is fixed top with 3.5rem height; main content gets 4rem padding-top to avoid overlap.
+  - Sidebar now has `max-width` constraints and `overflow-x: hidden` to prevent content bleed; inner panel is the only element with width constraints (preserving Streamlit collapse behavior).
+  - File uploader (`stFileUploader`) is constrained to `width: 100%`/`max-width: 100%` and `box-sizing: border-box`.
+- Chart containers (`.stPlotlyChart`) are horizontally scrollable on mobile with `min-width: 600px` to prevent heatmap cells from shrinking too small.
+- Calendar heatmap column widths changed from `[0.88, 0.12]` to `[0.78, 0.22]`; weekly text now `Opt:XX`; colorbars hidden (`showscale=False`).
+- Plots use `st.plotly_chart(..., config={"displayModeBar": False, "scrollZoom": False})` for touch usability.
+- Curve tab markers enlarged for touch: account equity marker 8px, SPX marker 7px, expiry marker 13px.
+- View tabs in phone use `flex-wrap: nowrap`, `max-width:33.3333%`, and `overflow-x: hidden` ensuring all 3 fit in one row.
+- Tooltip, header, and sidebar toggler UI are improved for mobile clarity and confirmed via manual device emulation.
+

@@ -140,7 +140,7 @@ def _build_calendar_matrix(
 
     weekly_text = weekly_summary.copy().astype(object)
     weekly_text["label"] = weekly_text.apply(
-        lambda row: f"{_fmt_signed(row['weekly_pnl'], 1)} Total Option: {int(round(row['weekly_options']))}",
+        lambda row: f"{_fmt_signed(row['weekly_pnl'], 1)} Opt:{int(round(row['weekly_options']))}",
         axis=1,
     )
 
@@ -176,8 +176,8 @@ def render_calendar_tab(daily_df: pd.DataFrame) -> None:
         rows=1,
         cols=2,
         shared_yaxes=True,
-        horizontal_spacing=0.01,
-        column_widths=[0.88, 0.12],
+        horizontal_spacing=0.02,
+        column_widths=[0.78, 0.22],
     )
 
     fig.add_trace(
@@ -192,14 +192,7 @@ def render_calendar_tab(daily_df: pd.DataFrame) -> None:
             zmin=-1,
             zmax=1,
             zmid=0,
-            colorbar={
-                "title": "Daily PnL",
-                "tickmode": "array",
-                "tickvals": [-1, 0, 1],
-                "ticktext": _colorbar_ticktext(pnl_matrix.values),
-                "len": 0.6,
-                "x": 1.02,
-            },
+            showscale=False,
             hovertemplate="%{customdata[2]}<br>PnL=%{customdata[0]:+.1f}<br>Commission=%{customdata[1]:.1f}<extra></extra>",
             hoverongaps=False,
             xgap=2,
@@ -221,14 +214,7 @@ def render_calendar_tab(daily_df: pd.DataFrame) -> None:
             zmin=-1,
             zmax=1,
             zmid=0,
-            colorbar={
-                "title": "Weekly PnL",
-                "tickmode": "array",
-                "tickvals": [-1, 0, 1],
-                "ticktext": _colorbar_ticktext(weekly_text[["weekly_pnl"]].values),
-                "len": 0.6,
-                "x": 1.1,
-            },
+            showscale=False,
             hovertemplate="%{customdata[2]} ~ %{customdata[3]}<br>Weekly PnL=%{customdata[0]:+.1f}<br>Weekly Commission=%{customdata[1]:.1f}<extra></extra>",
             xgap=2,
             ygap=2,
@@ -237,7 +223,11 @@ def render_calendar_tab(daily_df: pd.DataFrame) -> None:
         col=2,
     )
 
-    fig.update_layout(height=480, margin={"l": 20, "r": 20, "t": 20, "b": 20})
+    num_weeks = len(week_numbers)
+    fig.update_layout(
+        height=max(360, num_weeks * 42 + 40),
+        margin={"l": 20, "r": 10, "t": 20, "b": 20},
+    )
     fig.update_yaxes(
         autorange="reversed",
         tickmode="array",
@@ -248,7 +238,11 @@ def render_calendar_tab(daily_df: pd.DataFrame) -> None:
     )
     fig.update_yaxes(matches="y", row=1, col=2)
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displayModeBar": False, "scrollZoom": False},
+    )
 
     st.dataframe(
         daily_df.sort_values("activity_date", ascending=False)

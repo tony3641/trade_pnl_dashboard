@@ -13,8 +13,8 @@ streamlit run app.py
 
 | Format | Broker | Notes |
 |--------|--------|-------|
-| `.csv` | Schwab | Transaction history export |
-| `.qfx` | Interactive Brokers | OFX/QFX investment statement |
+| `.csv` | IB | Perf & Reports -> Transaction History -> CSV |
+| `.qfx` | IB | Perf & Reports -> 3rd Party Reports -> Quicken Web Connect |
 | `.pdf` | E*Trade (Morgan Stanley) | Monthly client statement |
 
 Upload one or multiple files in the sidebar, or provide a local file path. All sources are merged into a single trade ledger.

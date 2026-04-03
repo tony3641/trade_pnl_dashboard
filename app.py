@@ -17,6 +17,187 @@ from src.ui.tab_risk import render_risk_tab
 
 
 st.set_page_config(page_title="Trade PnL Dashboard", layout="wide")
+
+# ---------------------------------------------------------------------------
+# Responsive mobile CSS
+# ---------------------------------------------------------------------------
+st.markdown("""
+<style>
+@media (max-width: 768px) {
+    /* ---------------------------------------------------------------
+       Header bar: fixed at top, sits above everything
+    --------------------------------------------------------------- */
+    [data-testid="stHeader"] {
+        position: fixed !important;
+        top: 0 !important;
+        left: 0 !important;
+        right: 0 !important;
+        z-index: 9999 !important;
+        height: 3.5rem !important;
+        background: var(--background-color, #0e1117) !important;
+    }
+
+    /* Sidebar toggle control is top-most and always visible */
+    [data-testid="stSidebarCollapsedControl"] {
+        position: fixed !important;
+        top: 0.5rem !important;
+        left: 0.5rem !important;
+        z-index: 10001 !important;
+        width: 34px !important;
+        height: 34px !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        color: #fff !important;
+        background: rgba(10, 10, 10, 0.5) !important;
+        border-radius: 6px !important;
+        box-shadow: 0 0 10px rgba(0,0,0,0.45) !important;
+    }
+    [data-testid="stSidebarCollapsedControl"] * {
+        color: #fff !important;
+        font-size: 1.1rem !important;
+    }
+
+    /* Push main content below the fixed header */
+    .stMainBlockContainer,
+    [data-testid="stMainBlockContainer"] {
+        padding-top: 4rem !important;
+        padding-left: 0.75rem !important;
+        padding-right: 0.75rem !important;
+    }
+
+    /* ---------------------------------------------------------------
+       Sidebar: proper overlay that fully collapses off-screen.
+       Do NOT override width on the outer stSidebar element — that
+       breaks Streamlit's translateX close animation. Instead, only
+       style the inner content panel so it fills the overlay width.
+    --------------------------------------------------------------- */
+    [data-testid="stSidebar"] {
+        z-index: 9998 !important;
+    }
+    [data-testid="stSidebar"] > div:first-child {
+        width: min(80vw, 336px) !important;
+        max-width: min(80vw, 336px) !important;
+        overflow-x: hidden !important;
+        box-sizing: border-box !important;
+    }
+    /* Ensure complete collapse: if the sidebar gets translated left, do not show a tiny edge */
+    [data-testid="stSidebar"] {
+        overflow-x: hidden !important;
+    }
+    /* Constrain all sidebar content to the panel width */
+    [data-testid="stSidebar"] * {
+        max-width: 100% !important;
+        box-sizing: border-box !important;
+    }
+    /* File uploader box specifically */
+    [data-testid="stFileUploader"],
+    [data-testid="stFileUploader"] > div,
+    [data-testid="stFileUploader"] section {
+        width: 100% !important;
+        max-width: 100% !important;
+        min-width: 0 !important;
+    }
+
+    /* ---------------------------------------------------------------
+       Stack columns vertically
+    --------------------------------------------------------------- */
+    [data-testid="stHorizontalBlock"] {
+        flex-direction: column !important;
+        gap: 0.25rem !important;
+    }
+    [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+        width: 100% !important;
+        flex: 1 1 100% !important;
+        min-width: 0 !important;
+    }
+
+    /* Touch-friendly radio buttons and segmented controls */
+    [data-testid="stRadio"] label,
+    [data-testid="stSegmentedControl"] button {
+        min-height: 44px !important;
+        padding: 0.3rem 0.4rem !important;
+        font-size: 0.78rem !important;
+        white-space: nowrap !important;
+    }
+
+    /* Force view select controls to fit into one row on mobile */
+    [data-testid="stSegmentedControl"],
+    [data-testid="stRadio"] > div {
+        display: flex !important;
+        flex-wrap: nowrap !important;
+        width: 100% !important;
+        justify-content: space-between !important;
+    }
+    [data-testid="stSegmentedControl"] button,
+    [data-testid="stRadio"] label {
+        flex: 1 1 0 !important;
+        min-width: 0 !important;
+        text-align: center !important;
+        margin: 0 !important;
+        max-width: 33.3333% !important;
+    }
+
+    /* Tab set row should not wrap across two lines */
+    [data-testid="stSegmentedControl"],
+    [data-testid="stRadio"] > div {
+        flex-wrap: nowrap !important;
+        overflow-x: hidden !important;
+    }
+
+    /* Keep scrollbar style for overflow fallback */
+    [data-testid="stRadio"] > div::-webkit-scrollbar,
+    [data-testid="stSegmentedControl"]::-webkit-scrollbar {
+        height: 6px !important;
+    }
+    [data-testid="stRadio"] > div::-webkit-scrollbar-thumb,
+    [data-testid="stSegmentedControl"]::-webkit-scrollbar-thumb {
+        background: rgba(140, 158, 210, 0.4) !important;
+        border-radius: 4px !important;
+    }
+
+    /* Increase metric card readability */
+    [data-testid="stMetric"] {
+        padding: 0.4rem 0.3rem !important;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.78rem !important;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: 1.15rem !important;
+    }
+
+    /* Touch-friendly inputs */
+    [data-testid="stNumberInput"] input,
+    [data-testid="stTextInput"] input,
+    [data-testid="stDateInput"] input,
+    [data-testid="stSelectbox"] > div {
+        min-height: 44px !important;
+        font-size: 1rem !important;
+    }
+
+    /* Horizontal scroll for dataframes instead of squish */
+    [data-testid="stDataFrame"] {
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch !important;
+    }
+
+    /* Plotly chart containers: allow horizontal scroll on mobile */
+    .stPlotlyChart {
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch !important;
+    }
+    .stPlotlyChart > div {
+        min-width: 600px !important;
+    }
+
+    /* Compact title */
+    h1 { font-size: 1.4rem !important; }
+    h2, h3 { font-size: 1.1rem !important; }
+}
+</style>
+""", unsafe_allow_html=True)
+
 st.title("Trade PnL Dashboard")
 st.caption("Realized PnL uses broker Net Amount. Other Fee is excluded from PnL totals.")
 

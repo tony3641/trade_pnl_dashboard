@@ -19,6 +19,10 @@ class PnlResult:
 
 
 def _derive_option_fields(df: pd.DataFrame) -> pd.DataFrame:
+    # If already enriched, avoid re-deriving (which would duplicate columns)
+    if "contract_key" in df.columns and "is_option" in df.columns:
+        return df.reset_index(drop=True)
+
     rows = []
     for _, row in df.iterrows():
         parsed = parse_occ_option_symbol(row["symbol"])

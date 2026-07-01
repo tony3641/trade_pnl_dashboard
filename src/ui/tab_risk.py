@@ -69,11 +69,22 @@ def _fmt_recovery(max_days: int | None, ongoing_days: int | None) -> str:
     return f"{max_days}d"
 
 
+def _regime_row(table: pd.DataFrame, regime_label: str) -> dict:
+    """Extract one regime row from the regime table, returning NaN defaults if missing."""
+    if table is None or table.empty:
+        return {"days": 0, "net_pnl": np.nan, "win_rate": np.nan, "net_ev": np.nan}
+    row = table[table["regime"] == regime_label]
+    if row.empty:
+        return {"days": 0, "net_pnl": np.nan, "win_rate": np.nan, "net_ev": np.nan}
+    return row.iloc[0].to_dict()
+
+
 def _calc_metrics(
     view: pd.DataFrame,
     initial_capital: float,
     annual_rf: float,
     spx_df: pd.DataFrame | None = None,
+    vix_df: pd.DataFrame | None = None,
 ) -> dict[str, float | int | None]:
     if view.empty:
         return {}
@@ -211,6 +222,87 @@ def _calc_metrics(
                 alpha_daily = ((strategy_series - rf_daily) - spx_beta * (benchmark_series - rf_daily)).mean()
                 spx_alpha = alpha_daily * 252.0
 
+    # --- VIX metrics ---
+    vix_corr = np.nan
+    vix_beta = np.nan
+    vix_regime_table: pd.DataFrame = pd.DataFrame()
+    vix_overlap_days = 0
+
+    if vix_df is not None and not vix_df.empty:
+        # 1. VIX correlation & beta (vs vix_change, i.e. daily point moves)
+        strategy = view[["activity_date"]].copy()
+        strategy["strategy_return"] = daily_returns.values
+
+        benchmark = vix_df[["activity_date", "vix_change"]].copy()
+        aligned = strategy.merge(benchmark, on="activity_date", how="inner").dropna()
+        vix_overlap_days = int(len(aligned))
+
+        if vix_overlap_days >= 2:
+            strategy_series = aligned["strategy_return"].astype(float)
+            benchmark_series = aligned["vix_change"].astype(float)
+            benchmark_var = benchmark_series.var(ddof=1)
+
+            vix_corr = strategy_series.corr(benchmark_series)
+
+            if not pd.isna(benchmark_var) and not np.isclose(benchmark_var, 0.0):
+                covariance = strategy_series.cov(benchmark_series)
+                vix_beta = covariance / benchmark_var
+
+        # 2. Regime breakdown — classify by VIX *high* (captures intraday spikes)
+        regime_merge = view[["activity_date", "realized_pnl"]].copy()
+        regime_merge = regime_merge.merge(
+            vix_df[["activity_date", "vix_high", "vix_close"]],
+            on="activity_date",
+            how="inner",
+        ).dropna(subset=["vix_high"])
+
+        if not regime_merge.empty:
+            def _classify_vix_regime(vix_high_val: float) -> str:
+                if vix_high_val < 15.0:
+                    return "Calm (High<15)"
+                elif vix_high_val < 20.0:
+                    return "Normal (High 15-20)"
+                elif vix_high_val < 25.0:
+                    return "Elevated (High 20-25)"
+                else:
+                    return "Stress (High>25)"
+
+            regime_merge["regime"] = regime_merge["vix_high"].apply(_classify_vix_regime)
+
+            regime_order = [
+                "Calm (High<15)", "Normal (High 15-20)",
+                "Elevated (High 20-25)", "Stress (High>25)",
+            ]
+            regime_merge["regime"] = pd.Categorical(
+                regime_merge["regime"], categories=regime_order, ordered=True,
+            )
+
+            vix_regime_table = (
+                regime_merge.groupby("regime", observed=False)
+                .agg(
+                    days=("activity_date", "count"),
+                    net_pnl=("realized_pnl", "sum"),
+                    win_rate=("realized_pnl", lambda s: (s > 0).mean()),
+                    avg_win=("realized_pnl", lambda s: s[s > 0].mean()),
+                    avg_loss=("realized_pnl", lambda s: abs(s[s < 0].mean())),
+                    avg_vix_close=("vix_close", "mean"),
+                )
+                .reset_index()
+            )
+            # Compute Net EV per regime: P(win)×AvgWin - P(loss)×AvgLoss
+            vix_regime_table["net_ev"] = vix_regime_table.apply(
+                lambda r: (
+                    r["win_rate"] * r["avg_win"]
+                    - (1.0 - r["win_rate"]) * r["avg_loss"]
+                    if (not pd.isna(r["win_rate"]) and not pd.isna(r["avg_win"])
+                        and not pd.isna(r["avg_loss"]))
+                    else (r["avg_win"] if not pd.isna(r["avg_win"])
+                          else (-r["avg_loss"] if not pd.isna(r["avg_loss"]) else np.nan))
+                ),
+                axis=1,
+            )
+            vix_regime_table = vix_regime_table.drop(columns=["avg_win", "avg_loss"])
+
     return {
         "period_return": float(period_return),
         "sharpe": float(sharpe) if not pd.isna(sharpe) else np.nan,
@@ -230,10 +322,18 @@ def _calc_metrics(
         "spx_period_return": float(spx_period_return) if not pd.isna(spx_period_return) else np.nan,
         "return_delta_vs_spx": float(return_delta_vs_spx) if not pd.isna(return_delta_vs_spx) else np.nan,
         "spx_overlap_days": spx_overlap_days,
+        "vix_corr": float(vix_corr) if not pd.isna(vix_corr) else np.nan,
+        "vix_beta": float(vix_beta) if not pd.isna(vix_beta) else np.nan,
+        "vix_overlap_days": vix_overlap_days,
+        "vix_regime_table": vix_regime_table,
     }
 
 
-def render_risk_tab(daily_df: pd.DataFrame, spx_df: pd.DataFrame | None = None) -> None:
+def render_risk_tab(
+    daily_df: pd.DataFrame,
+    spx_df: pd.DataFrame | None = None,
+    vix_df: pd.DataFrame | None = None,
+) -> None:
     st.subheader("Risk Measurement")
 
     if daily_df.empty:
@@ -301,6 +401,7 @@ def render_risk_tab(daily_df: pd.DataFrame, spx_df: pd.DataFrame | None = None) 
         initial_capital=float(initial_capital),
         annual_rf=float(annual_rf_pct) / 100.0,
         spx_df=spx_df,
+        vix_df=vix_df,
     )
 
     st.markdown(
@@ -357,11 +458,72 @@ def render_risk_tab(daily_df: pd.DataFrame, spx_df: pd.DataFrame | None = None) 
     row4[3].metric("SPX Return in Period", _fmt_pct(metrics.get("spx_period_return")))
     row4[4].metric("Return Delta vs SPX", _fmt_pct(metrics.get("return_delta_vs_spx")))
 
+    # --- VIX regime row ---
+    regime_table = metrics.get("vix_regime_table")
+    st.markdown(
+        "<div style='font-size:0.95rem; font-weight:600; text-align:left;'>"
+        "Volatility Regime (VIX — classified by daily high)</div>",
+        unsafe_allow_html=True,
+    )
+    row5 = st.columns(4)
+    row5[0].metric("VIX Correlation", _fmt_float(metrics.get("vix_corr"), 3))
+    row5[1].metric(
+        "Strategy-VIX Beta",
+        _fmt_float(metrics.get("vix_beta"), 3),
+        help="Sensitivity of strategy daily return to a 1-point move in VIX close.",
+    )
+    calm = _regime_row(regime_table, "Calm (High<15)")
+    row5[2].metric(
+        "Calm (High<15) Win Rate",
+        _fmt_pct(calm.get("win_rate")),
+        help=f"Days: {calm.get('days', 0)}. Net PnL: {_fmt_currency(calm.get('net_pnl'))}",
+    )
+    stress = _regime_row(regime_table, "Stress (High>25)")
+    row5[3].metric(
+        "Stress (High>25) Win Rate",
+        _fmt_pct(stress.get("win_rate")),
+        help=f"Days: {stress.get('days', 0)}. Net PnL: {_fmt_currency(stress.get('net_pnl'))}",
+    )
+
+    if regime_table is not None and not regime_table.empty:
+        with st.expander("VIX Regime Breakdown"):
+            display_table = regime_table.copy()
+            display_table["net_pnl"] = display_table["net_pnl"].apply(
+                lambda v: _fmt_currency(v) if not pd.isna(v) else "N/A"
+            )
+            display_table["win_rate"] = display_table["win_rate"].apply(
+                lambda v: _fmt_pct(v) if not pd.isna(v) else "N/A"
+            )
+            display_table["net_ev"] = display_table["net_ev"].apply(
+                lambda v: _fmt_currency(v) if not pd.isna(v) else "N/A"
+            )
+            display_table["avg_vix_close"] = display_table["avg_vix_close"].apply(
+                lambda v: f"{v:.1f}" if not pd.isna(v) else "N/A"
+            )
+            display_table = display_table.rename(columns={
+                "regime": "VIX Regime",
+                "days": "Days",
+                "net_pnl": "Net P&L",
+                "win_rate": "Win Rate",
+                "net_ev": "Net EV",
+                "avg_vix_close": "Avg VIX Close",
+            })
+            st.dataframe(
+                display_table,
+                use_container_width=True,
+                hide_index=True,
+            )
+
     st.caption(
         "Returns use realized daily PnL scaled by initial capital. "
         "Sharpe/Sortino are annualized with 252 trading days. "
-        "SPX metrics use aligned daily returns versus ^GSPC close."
+        "SPX metrics use aligned daily returns versus ^GSPC close. "
+        "VIX metrics use aligned daily returns versus ^VIX close changes; "
+        "regimes are classified by the daily VIX high."
     )
 
     if int(metrics.get("spx_overlap_days", 0)) < 2:
         st.info("SPX metrics require at least 2 overlapping dates with benchmark data.")
+
+    if int(metrics.get("vix_overlap_days", 0)) < 2:
+        st.info("VIX metrics require at least 2 overlapping dates with VIX data.")

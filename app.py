@@ -11,6 +11,7 @@ from src.io.load_csv import load_transactions_csv
 from src.io.load_etrade_pdf import EtradeBalance, load_transactions_etrade_pdf
 from src.io.load_qfx import InvBalance, load_transactions_qfx
 from src.io.load_spx import load_spx_daily
+from src.io.load_vix import load_vix_daily
 from src.ui.tab_calendar import render_calendar_tab
 from src.ui.tab_curve import render_curve_tab
 from src.ui.tab_risk import render_risk_tab
@@ -359,6 +360,32 @@ def _load_spx_for_period(daily_df: pd.DataFrame) -> pd.DataFrame:
             return pd.DataFrame(columns=["activity_date", "spx_close", "spx_return"])
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def _load_vix_cached(start_date, end_date) -> pd.DataFrame:
+    return load_vix_daily(start_date, end_date)
+
+
+def _load_vix_for_period(daily_df: pd.DataFrame) -> pd.DataFrame:
+    if daily_df.empty:
+        return pd.DataFrame(columns=[
+            "activity_date", "vix_open", "vix_high",
+            "vix_low", "vix_close", "vix_change",
+        ])
+
+    with st.spinner("Loading VIX historical data..."):
+        try:
+            return _load_vix_cached(
+                daily_df["activity_date"].min(),
+                daily_df["activity_date"].max(),
+            )
+        except Exception as exc:
+            st.warning(f"VIX data could not be loaded: {exc}")
+            return pd.DataFrame(columns=[
+                "activity_date", "vix_open", "vix_high",
+                "vix_low", "vix_close", "vix_change",
+            ])
+
+
 raw_df, all_balances = _load_input()
 if raw_df is None:
     st.info("Upload your CSV or QFX file(s) in the sidebar to start.")
@@ -504,4 +531,5 @@ elif view_label == "Daily Calendar":
     render_calendar_tab(daily)
 else:
     spx_daily = _load_spx_for_period(daily)
-    render_risk_tab(daily, spx_daily)
+    vix_daily = _load_vix_for_period(daily)
+    render_risk_tab(daily, spx_daily, vix_daily)

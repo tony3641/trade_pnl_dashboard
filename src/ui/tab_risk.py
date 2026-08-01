@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from datetime import timedelta
-import math
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+from src.domain.risk_metrics import calculate_risk_metrics as _calc_metrics
 
 
 WINDOW_OPTIONS = ["1M", "3M", "YTD", "1Y", "All", "Custom"]

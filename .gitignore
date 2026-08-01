@@ -18,3 +18,14 @@ htmlcov/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Generated artifacts (reports, cached market data)
+*.html
+*.csv
+
+# Hidden / transient dot-folders (e.g. .playwright-mcp/, .streamlit/)
+.*/
+!.github/       # keep GitHub Actions workflows commit-able
+
+# Local tool config
+.mcp.json

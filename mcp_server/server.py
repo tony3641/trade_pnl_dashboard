@@ -1,0 +1,845 @@
+"""MCP server for Trade PnL Dashboard analysis tools.
+
+Run with::
+
+    python -m mcp_server.server
+
+Or via FastMCP CLI::
+
+    fastmcp run mcp_server.server
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import re
+import shutil
+import tempfile
+import traceback
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pandas as pd
+from mcp.server.fastmcp import FastMCP
+
+from reports.generate_report import build_report
+
+from src.domain.merge import merge_transaction_frames
+from src.domain.parse_option_symbol import (
+    ParsedOption,
+    build_occ_symbol as _domain_build_occ_symbol,
+    parse_occ_option_symbol,
+)
+from src.domain.pnl_engine import PnlResult, build_realized_pnl
+from src.domain.risk_metrics import calculate_risk_metrics
+from src.io.load_csv import load_transactions_csv
+from src.io.load_etrade_pdf import EtradeBalance, load_transactions_etrade_pdf
+from src.io.load_qfx import InvBalance, load_transactions_qfx
+from src.io.load_spx import load_spx_daily
+from src.io.load_vix import load_vix_daily
+from src.ui.tab_calendar import _build_calendar_matrix
+
+from mcp_server.adapter import (
+    _safe_value,
+    balance_to_dict,
+    calendar_to_dict,
+    df_to_records,
+    friendly_date,
+    metrics_to_dict,
+    parsed_option_to_dict,
+    pnl_result_to_daily_series,
+    pnl_result_to_summary,
+    pnl_result_to_top_contracts,
+    serialize_float,
+)
+
+# ---------------------------------------------------------------------------
+# FastMCP application
+# ---------------------------------------------------------------------------
+
+mcp = FastMCP("trade-pnl-dashboard")
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+_BalanceInfo = InvBalance | EtradeBalance
+
+
+def _load_file_from_path(path_str: str) -> tuple[pd.DataFrame, _BalanceInfo | None, str | None]:
+    """Load a single file from a local path. Returns (df, balance, warning)."""
+    p = Path(path_str)
+    ext = p.suffix.lower()
+    try:
+        if ext == ".qfx":
+            df, bal = load_transactions_qfx(p)
+            return df, bal, None
+        elif ext == ".pdf":
+            df, bal = load_transactions_etrade_pdf(p)
+            return df, bal, None
+        else:
+            df = load_transactions_csv(p)
+            return df, None, None
+    except (ValueError, ImportError, FileNotFoundError, OSError) as exc:
+        return pd.DataFrame(), None, f"{p.name}: {exc}"
+
+
+def _load_file_from_bytes(
+    name: str,
+    data: bytes,
+) -> tuple[pd.DataFrame, _BalanceInfo | None, str | None]:
+    """Load a single file from in-memory bytes. Returns (df, balance, warning)."""
+    ext = Path(name).suffix.lower()
+    buf = io.BytesIO(data)
+    try:
+        if ext == ".qfx":
+            df, bal = load_transactions_qfx(buf)
+            return df, bal, None
+        elif ext == ".pdf":
+            df, bal = load_transactions_etrade_pdf(buf)
+            return df, bal, None
+        else:
+            # CSV: load_transactions_csv expects a file-like object or path
+            df = load_transactions_csv(buf)
+            return df, None, None
+    except (ValueError, ImportError) as exc:
+        return pd.DataFrame(), None, f"{name}: {exc}"
+
+
+def _load_and_merge(
+    paths: list[str] | None = None,
+    file_contents: list[dict[str, str]] | None = None,
+) -> tuple[pd.DataFrame, list[_BalanceInfo], list[str]]:
+    """Load, merge, and deduplicate transaction files.
+
+    Returns ``(merged_df, balances, warnings)``.
+    """
+    frames: list[pd.DataFrame] = []
+    balances: list[_BalanceInfo] = []
+    warnings: list[str] = []
+
+    # -- Local paths ----------------------------------------------------------
+    for path_str in (paths or []):
+        df, bal, warn = _load_file_from_path(path_str)
+        if not df.empty:
+            frames.append(df)
+        if bal is not None:
+            balances.append(bal)
+        if warn:
+            warnings.append(warn)
+
+    # -- In-memory file contents ----------------------------------------------
+    for fc in (file_contents or []):
+        name = fc.get("name", "unknown.csv")
+        data_text = fc.get("data_text")
+        data_b64 = fc.get("data_base64")
+
+        if data_b64 is not None:
+            try:
+                raw = base64.b64decode(data_b64)
+            except Exception as exc:
+                warnings.append(f"{name}: base64 decode failed ({exc})")
+                continue
+        elif data_text is not None:
+            raw = data_text.encode("utf-8")
+        else:
+            warnings.append(f"{name}: neither data_text nor data_base64 provided — skipped")
+            continue
+
+        df, bal, warn = _load_file_from_bytes(name, raw)
+        if not df.empty:
+            frames.append(df)
+        if bal is not None:
+            balances.append(bal)
+        if warn:
+            warnings.append(warn)
+
+    if not frames:
+        return pd.DataFrame(), balances, warnings
+
+    try:
+        merged = merge_transaction_frames(frames)
+    except Exception as exc:
+        warnings.append(f"Merge failed: {exc}")
+        # Fall back to simple concatenation
+        merged = pd.concat(frames, ignore_index=True)
+        merged = merged.sort_values("activity_date").reset_index(drop=True)
+
+    return merged, balances, warnings
+
+
+def _filter_window(
+    df: pd.DataFrame,
+    window: str = "All",
+    custom_start: str | None = None,
+    custom_end: str | None = None,
+) -> pd.DataFrame:
+    """Apply time-window filter to a daily-PnL DataFrame."""
+    if df.empty or window == "All":
+        return df.sort_values("activity_date").reset_index(drop=True)
+
+    last_date = df["activity_date"].max()
+
+    if window == "Custom":
+        c_start = pd.to_datetime(custom_start).date() if custom_start else df["activity_date"].min()
+        c_end = pd.to_datetime(custom_end).date() if custom_end else last_date
+        return (
+            df[(df["activity_date"] >= c_start) & (df["activity_date"] <= c_end)]
+            .copy()
+            .sort_values("activity_date")
+            .reset_index(drop=True)
+        )
+
+    if window == "1M":
+        start = last_date - timedelta(days=29)
+    elif window == "3M":
+        start = last_date - timedelta(days=89)
+    elif window == "1Y":
+        start = last_date - timedelta(days=364)
+    else:  # YTD
+        start = pd.Timestamp(last_date.year, 1, 1).date()
+
+    return (
+        df[df["activity_date"] >= start]
+        .copy()
+        .sort_values("activity_date")
+        .reset_index(drop=True)
+    )
+
+
+def _resolve_initial_capital(
+    balances: list[_BalanceInfo],
+    merged_df: pd.DataFrame,
+    provided: float | None,
+) -> float:
+    """Resolve initial capital: use provided value, or auto-infer from balances."""
+    if provided is not None:
+        return float(provided)
+
+    capital_parts: dict[str, float] = {}
+
+    for bal in balances:
+        if isinstance(bal, InvBalance):
+            qfx_accounts = set(
+                merged_df[merged_df["account_id"].str.startswith("U", na=False)]["account_id"].unique()
+            )
+            if qfx_accounts:
+                acct_net = float(
+                    merged_df[merged_df["account_id"].isin(qfx_accounts)]["net_amount"]
+                    .fillna(0.0).sum()
+                )
+            else:
+                acct_net = float(merged_df["net_amount"].fillna(0.0).sum())
+            capital_parts["__qfx__"] = bal.total - acct_net
+        elif isinstance(bal, EtradeBalance):
+            existing = capital_parts.get(bal.account_id)
+            if existing is None:
+                capital_parts[bal.account_id] = bal.beginning_value
+
+    if capital_parts:
+        return sum(capital_parts.values())
+
+    return 100_000.0  # sensible default
+
+
+# ---------------------------------------------------------------------------
+# Tool 6: parse_occ_symbol
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def parse_occ_symbol(symbol: str) -> dict[str, Any]:
+    """Parse an OCC option symbol into its components.
+
+    Args:
+        symbol: OCC option symbol, e.g. "SPXW  260202P06940000"
+
+    Returns:
+        Dict with underlying, expiry_date, right, strike, and contract_key,
+        or an error key if parsing fails.
+    """
+    result = parse_occ_option_symbol(symbol)
+    if result is None:
+        return {"error": f"Could not parse symbol: {symbol!r}"}
+    return parsed_option_to_dict(result)
+
+
+# ---------------------------------------------------------------------------
+# Tool 7: build_occ_symbol
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def build_occ_symbol(
+    underlying: str,
+    expiry: str,
+    right: str,
+    strike: float,
+) -> dict[str, Any]:
+    """Build a padded OCC option symbol from components.
+
+    Args:
+        underlying: Underlying ticker, e.g. "SPXW"
+        expiry: Expiration date as "YYYY-MM-DD"
+        right: Option right, "P" for put or "C" for call
+        strike: Strike price, e.g. 6940.0
+
+    Returns:
+        Dict with occ_symbol and contract_key.
+    """
+    try:
+        expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+    except ValueError:
+        return {"error": f"Invalid expiry date format: {expiry!r}. Use YYYY-MM-DD."}
+
+    symbol = _domain_build_occ_symbol(underlying, expiry_date, right, strike)
+    # Build the contract key in the same format as parse_occ_option_symbol
+    contract_key = f"{underlying.upper()}|{expiry_date.isoformat()}|{right.upper()}|{strike:.3f}"
+
+    return {
+        "occ_symbol": symbol,
+        "contract_key": contract_key,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 1: get_transaction_summary
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_transaction_summary(
+    paths: list[str] | None = None,
+    file_contents: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Load transaction files and return a summary of their contents.
+
+    Use this first to understand what data is available before running
+    deeper analysis.
+
+    Args:
+        paths: Optional list of local file paths (CSV, QFX, or PDF).
+        file_contents: Optional list of dicts, each with:
+            - name (required): filename with extension for format detection
+            - data_text (optional): raw text content for CSV/QFX files
+            - data_base64 (optional): base64-encoded bytes for PDFs or binary
+
+    Returns:
+        Dict with total_rows, date_range, accounts, transaction_types,
+        balances, and any warnings.
+    """
+    try:
+        merged, balances, warnings = _load_and_merge(paths, file_contents)
+    except Exception as exc:
+        return {"error": str(exc), "traceback": traceback.format_exc()}
+
+    if merged.empty:
+        return {
+            "total_rows": 0,
+            "date_range": None,
+            "accounts": [],
+            "transaction_types": {},
+            "balances": [],
+            "warnings": warnings or ["No transaction data found in provided files."],
+        }
+
+    type_counts = (
+        merged["transaction_type"]
+        .fillna("Unknown")
+        .value_counts()
+        .to_dict()
+    )
+
+    return {
+        "total_rows": int(len(merged)),
+        "date_range": {
+            "start": friendly_date(merged["activity_date"].min()),
+            "end": friendly_date(merged["activity_date"].max()),
+        },
+        "accounts": sorted(merged["account_id"].dropna().unique().tolist()),
+        "transaction_types": {str(k): int(v) for k, v in type_counts.items()},
+        "balances": [balance_to_dict(b) for b in balances],
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 2: compute_daily_pnl
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def compute_daily_pnl(
+    paths: list[str] | None = None,
+    file_contents: list[dict[str, str]] | None = None,
+    account_filter: str = "All",
+    initial_capital: float | None = None,
+) -> dict[str, Any]:
+    """Run the realized PnL pipeline and return daily performance series.
+
+    Args:
+        paths: Optional list of local file paths (CSV, QFX, or PDF).
+        file_contents: Optional list of dicts with name and data_text/data_base64.
+        account_filter: Account ID to filter by, or "All" for all accounts.
+        initial_capital: Starting capital in dollars. Auto-inferred from
+            balance data if omitted (falls back to $100,000).
+
+    Returns:
+        Dict with initial_capital, summary totals, daily_series array,
+        and top_contracts list.
+    """
+    try:
+        merged, balances, warnings = _load_and_merge(paths, file_contents)
+    except Exception as exc:
+        return {"error": str(exc), "traceback": traceback.format_exc()}
+
+    if merged.empty:
+        return {"error": "No transaction data found in provided files.", "warnings": warnings}
+
+    capital = _resolve_initial_capital(balances, merged, initial_capital)
+
+    # Account filtering
+    if account_filter != "All" and account_filter in merged["account_id"].values:
+        merged = merged[merged["account_id"] == account_filter]
+
+    result = build_realized_pnl(merged)
+
+    return {
+        "initial_capital": capital,
+        **pnl_result_to_summary(result, initial_capital=capital),
+        "daily_series": pnl_result_to_daily_series(result),
+        "top_contracts": pnl_result_to_top_contracts(result, top_n=10),
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 8: get_contract_details
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_contract_details(
+    contract_key: str = "",
+    paths: list[str] | None = None,
+    file_contents: list[dict[str, str]] | None = None,
+    account_filter: str = "All",
+) -> dict[str, Any]:
+    """Get all trades and aggregate PnL for a specific option contract.
+
+    Args:
+        contract_key: Contract identifier, e.g. "SPXW|2026-02-02|P|6940.000".
+            Use parse_occ_symbol or build_occ_symbol to obtain this key.
+        paths: Optional list of local file paths.
+        file_contents: Optional list of dicts with name and data_text/data_base64.
+        account_filter: Account ID to filter by, or "All".
+
+    Returns:
+        Dict with contract metadata, total_pnl, net_quantity, trade list,
+        and a human-readable summary.
+    """
+    if not contract_key:
+        return {"error": "contract_key is required. Use parse_occ_symbol or build_occ_symbol to obtain one."}
+
+    try:
+        merged, _balances, warnings = _load_and_merge(paths, file_contents)
+    except Exception as exc:
+        return {"error": str(exc), "traceback": traceback.format_exc()}
+
+    if merged.empty:
+        return {"error": "No transaction data found.", "warnings": warnings}
+
+    if account_filter != "All" and account_filter in merged["account_id"].values:
+        merged = merged[merged["account_id"] == account_filter]
+
+    result = build_realized_pnl(merged)
+    enriched = result.enriched_rows
+
+    # Filter by contract key
+    if "contract_key" not in enriched.columns:
+        return {"error": "No option contract data available.", "warnings": warnings}
+
+    contract_rows = enriched[enriched["contract_key"] == contract_key]
+    if contract_rows.empty:
+        return {
+            "error": f"No trades found for contract key: {contract_key!r}",
+            "available_contracts_hint": (
+                enriched.loc[enriched["is_option"], "contract_key"]
+                .dropna().unique()[:20].tolist()
+            ),
+        }
+
+    # Metadata from first row
+    first = contract_rows.iloc[0]
+    total_pnl = serialize_float(contract_rows["net_amount"].sum()) or 0.0
+    total_commission = serialize_float(contract_rows["commission"].abs().sum()) or 0.0
+    net_qty = serialize_float(contract_rows["quantity"].sum()) or 0.0
+
+    trades = df_to_records(
+        contract_rows[[
+            "activity_date", "account_id", "transaction_type", "description",
+            "quantity", "price", "net_amount", "commission",
+            "is_expire_inferred", "is_option",
+        ]].sort_values("activity_date"),
+        date_cols=["activity_date"],
+    )
+
+    # Summary string
+    if abs(net_qty) < 0.001:
+        summary = f"Fully closed with ${total_pnl:,.2f} realized PnL"
+    else:
+        direction = "long" if net_qty > 0 else "short"
+        summary = f"Still open with {abs(net_qty)} net {direction} contracts"
+
+    return {
+        "contract_key": contract_key,
+        "underlying": first.get("underlying"),
+        "expiry_date": friendly_date(first.get("expiry_date")),
+        "right": first.get("right"),
+        "strike": serialize_float(first.get("strike")),
+        "total_pnl": total_pnl,
+        "total_commission": total_commission,
+        "net_quantity": net_qty,
+        "trade_count": int(len(contract_rows)),
+        "first_trade_date": friendly_date(contract_rows["activity_date"].min()),
+        "last_trade_date": friendly_date(contract_rows["activity_date"].max()),
+        "trades": trades,
+        "summary": summary,
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 5: get_market_data
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_market_data(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+) -> dict[str, Any]:
+    """Fetch daily SPX or VIX data from Yahoo Finance.
+
+    Args:
+        ticker: "SPX" for S&P 500 or "VIX" for CBOE Volatility Index.
+        start_date: Start date as "YYYY-MM-DD".
+        end_date: End date as "YYYY-MM-DD".
+
+    Returns:
+        Dict with ticker and series array of daily OHLC/returns.
+    """
+    ticker_upper = ticker.upper().strip()
+    if ticker_upper not in ("SPX", "VIX"):
+        return {"error": "ticker must be 'SPX' or 'VIX'"}
+
+    try:
+        s = datetime.strptime(start_date, "%Y-%m-%d").date()
+        e = datetime.strptime(end_date, "%Y-%m-%d").date()
+    except ValueError:
+        return {"error": "Dates must be in YYYY-MM-DD format."}
+
+    try:
+        if ticker_upper == "SPX":
+            df = load_spx_daily(s, e)
+            return {
+                "ticker": "SPX",
+                "series": df_to_records(df, date_cols=["activity_date"]),
+            }
+        else:
+            df = load_vix_daily(s, e)
+            return {
+                "ticker": "VIX",
+                "series": df_to_records(df, date_cols=["activity_date"]),
+            }
+    except Exception as exc:
+        return {"error": str(exc), "traceback": traceback.format_exc()}
+
+
+# ---------------------------------------------------------------------------
+# Tool 4: get_calendar_data
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_calendar_data(
+    paths: list[str] | None = None,
+    file_contents: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Build weekly calendar matrix of daily PnL for heatmap visualization.
+
+    Args:
+        paths: Optional list of local file paths (CSV, QFX, or PDF).
+        file_contents: Optional list of dicts with name and data_text/data_base64.
+
+    Returns:
+        Dict with week_labels, weekday_labels, pnl_matrix, commission_matrix,
+        date_matrix, and weekly_summary. Matrices are lists of rows (week_seq x 7).
+        Weekend values (Sat/Sun) are null.
+    """
+    try:
+        merged, _balances, warnings = _load_and_merge(paths, file_contents)
+    except Exception as exc:
+        return {"error": str(exc), "traceback": traceback.format_exc()}
+
+    if merged.empty:
+        return {"error": "No transaction data found.", "warnings": warnings}
+
+    result = build_realized_pnl(merged)
+    daily = result.daily
+
+    if daily.empty:
+        return {"error": "No daily PnL data.", "warnings": warnings}
+
+    (
+        pnl_matrix, commission_matrix, date_matrix,
+        text_cells, week_labels, weekly_text,
+    ) = _build_calendar_matrix(daily)
+
+    return {
+        **calendar_to_dict(
+            pnl_matrix, commission_matrix, date_matrix,
+            week_labels, weekly_text,
+        ),
+        "total_rows": int(len(daily)),
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 3: compute_risk_metrics
+# ---------------------------------------------------------------------------
+
+_WINDOW_OPTIONS = ["1M", "3M", "YTD", "1Y", "All", "Custom"]
+
+
+@mcp.tool()
+def compute_risk_metrics(
+    paths: list[str] | None = None,
+    file_contents: list[dict[str, str]] | None = None,
+    account_filter: str = "All",
+    initial_capital: float | None = None,
+    annual_rf_pct: float = 0.0,
+    window: str = "All",
+    custom_start: str | None = None,
+    custom_end: str | None = None,
+    with_spx: bool = True,
+    with_vix: bool = True,
+) -> dict[str, Any]:
+    """Compute risk-adjusted performance metrics with optional SPX/VIX benchmarking.
+
+    Args:
+        paths: Optional list of local file paths (CSV, QFX, or PDF).
+        file_contents: Optional list of dicts with name and data_text/data_base64.
+        account_filter: Account ID to filter by, or "All".
+        initial_capital: Starting capital in dollars. Auto-inferred if omitted.
+        annual_rf_pct: Annual risk-free rate as a percentage (e.g. 5.0 means 5%).
+            Default 0.0.
+        window: Time window — "1M", "3M", "YTD", "1Y", "All", or "Custom".
+        custom_start: Start date for Custom window, as "YYYY-MM-DD".
+        custom_end: End date for Custom window, as "YYYY-MM-DD".
+        with_spx: Whether to fetch SPX benchmark data (default True).
+        with_vix: Whether to fetch VIX data for regime analysis (default True).
+
+    Returns:
+        Dict with window, period_overview, daily_extremes, risk_adjusted,
+        spx_benchmark, vix_analysis, and warnings.
+    """
+    try:
+        merged, balances, warnings = _load_and_merge(paths, file_contents)
+    except Exception as exc:
+        return {"error": str(exc), "traceback": traceback.format_exc()}
+
+    if merged.empty:
+        return {"error": "No transaction data found.", "warnings": warnings}
+
+    capital = _resolve_initial_capital(balances, merged, initial_capital)
+
+    if account_filter != "All" and account_filter in merged["account_id"].values:
+        merged = merged[merged["account_id"] == account_filter]
+
+    pnl_result = build_realized_pnl(merged)
+    daily = pnl_result.daily
+
+    if window not in _WINDOW_OPTIONS:
+        return {"error": f"Invalid window: {window!r}. Must be one of {_WINDOW_OPTIONS}."}
+
+    view = _filter_window(daily, window, custom_start, custom_end)
+    if view.empty:
+        return {"error": "No data in selected window.", "warnings": warnings}
+
+    # Fetch benchmark data if requested
+    spx_df: pd.DataFrame | None = None
+    vix_df: pd.DataFrame | None = None
+
+    if with_spx:
+        try:
+            spx_df = load_spx_daily(
+                view["activity_date"].min(),
+                view["activity_date"].max(),
+            )
+        except Exception as exc:
+            warnings.append(f"SPX data fetch failed: {exc}")
+
+    if with_vix:
+        try:
+            vix_df = load_vix_daily(
+                view["activity_date"].min(),
+                view["activity_date"].max(),
+            )
+        except Exception as exc:
+            warnings.append(f"VIX data fetch failed: {exc}")
+
+    # Compute metrics
+    metrics = calculate_risk_metrics(
+        view=view,
+        initial_capital=float(capital),
+        annual_rf=annual_rf_pct / 100.0,
+        spx_df=spx_df,
+        vix_df=vix_df,
+    )
+
+    window_start = friendly_date(view["activity_date"].min())
+    window_end = friendly_date(view["activity_date"].max())
+
+    return {
+        "window": {
+            "label": window,
+            "start": window_start,
+            "end": window_end,
+            "trading_days": int(len(view)),
+        },
+        **metrics_to_dict(metrics),
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: generate_monthly_report
+# ---------------------------------------------------------------------------
+
+def _materialize_file_contents(fc: dict[str, str], tmpdir: str, index: int) -> str | None:
+    """Write an in-memory file_content to a temp file, returning its path."""
+    name = fc.get("name", "upload.qfx")
+    data_text = fc.get("data_text")
+    data_b64 = fc.get("data_base64")
+    if data_b64 is not None:
+        try:
+            raw = base64.b64decode(data_b64)
+        except Exception:
+            return None
+    elif data_text is not None:
+        raw = data_text.encode("utf-8")
+    else:
+        return None
+    ext = Path(name).suffix.lower() or ".qfx"
+    p = Path(tmpdir) / f"upload_{index}{ext}"
+    p.write_bytes(raw)
+    return str(p)
+
+
+@mcp.tool()
+def generate_monthly_report(
+    paths: list[str] | None = None,
+    file_contents: list[dict[str, str]] | None = None,
+    month: str | None = None,
+    annual_rf_pct: float = 4.0,
+    label: str | None = None,
+    ytd_paths: list[str] | None = None,
+    ytd_file_contents: list[dict[str, str]] | None = None,
+    offline: bool = False,
+    include_html: bool = False,
+) -> dict[str, Any]:
+    """Generate the comprehensive monthly trading report for a QFX statement.
+
+    Combines the monthly performance report (daily PnL, weekly breakdown,
+    risk-adjusted metrics at the risk-free rate, VIX regimes, SPX benchmark)
+    with the strategy-level edge & risk analysis (bull-put-credit-spread
+    structure, per-leg win rates, stops & re-entry, bootstrap significance,
+    spread-capped tail stress, Monte Carlo, Kelly) and optional cross-month
+    context. Returns the structured report data and writes a self-contained
+    HTML report to ``reports/output/``.
+
+    Args:
+        paths: Optional local QFX file path(s) for the target month.
+        file_contents: Optional in-memory files as dicts with ``name`` plus
+            ``data_text`` or ``data_base64``.
+        month: Optional calendar-month filter, e.g. ``"2026-06"`` when the
+            file spans several months.
+        annual_rf_pct: Annual risk-free rate as a percentage (e.g. 5.0 = 5%).
+        label: Report title, e.g. ``"July 2026"``.
+        ytd_paths / ytd_file_contents: Optional prior-month / YTD file for
+            cross-month context and pooled significance.
+        offline: When True, use the bundled SPX/VIX CSVs without a network
+            fetch. Default False -> fetches fresh SPX/VIX from Yahoo Finance
+            (keeping the benchmark and VIX regimes up to date) and caches the
+            result back into the CSVs.
+        include_html: When True, also return the full HTML report string.
+
+    Returns:
+        Dict with the structured report data (total_pnl, return_pct, risk,
+        spreads, edge, stops, tail, takeaways, cross_month, ...) plus
+        ``html_path`` and ``warnings``.
+    """
+    warnings: list[str] = []
+    monthly_src: str | None = None
+    ytd_src: str | None = None
+    tmpdir = tempfile.mkdtemp(prefix="report_")
+    try:
+        monthly_candidates = list(paths or [])
+        for i, fc in enumerate(file_contents or []):
+            p = _materialize_file_contents(fc, tmpdir, i)
+            if p:
+                monthly_candidates.append(p)
+            else:
+                warnings.append(f"{fc.get('name', '?')}: could not materialize — skipped")
+        if monthly_candidates:
+            monthly_src = monthly_candidates[0]
+            if len(monthly_candidates) > 1:
+                warnings.append("Multiple monthly files provided — using the first; others ignored.")
+
+        ytd_candidates = list(ytd_paths or [])
+        for i, fc in enumerate(ytd_file_contents or []):
+            p = _materialize_file_contents(fc, tmpdir, 100 + i)
+            if p:
+                ytd_candidates.append(p)
+        if ytd_candidates:
+            ytd_src = ytd_candidates[0]
+            if len(ytd_candidates) > 1:
+                warnings.append("Multiple YTD files provided — using the first; others ignored.")
+
+        if not monthly_src:
+            return {"error": "No monthly file provided (pass paths or file_contents).",
+                    "warnings": warnings}
+
+        ns = SimpleNamespace(monthly=monthly_src, month=month, ytd=ytd_src,
+                             rf=annual_rf_pct / 100.0, label=label, offline=bool(offline))
+        html_doc, report_data = build_report(ns)
+
+        if report_data is None:
+            return {"error": "No trades found in the provided monthly file.", "warnings": warnings}
+
+        out_dir = Path("reports") / "output"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        slug = re.sub(r"[^\w\-]+", "_", (label or report_data.get("month") or "report")).strip("_") or "report"
+        out_path = out_dir / f"{slug}_report.html"
+        out_path.write_text(html_doc, encoding="utf-8")
+
+        result = dict(report_data)
+        result["html_path"] = str(out_path.resolve())
+        if include_html:
+            result["html"] = html_doc
+        result["warnings"] = warnings
+        return _safe_value(result)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """Run the MCP server on stdio transport."""
+    mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

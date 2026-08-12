@@ -159,7 +159,7 @@ def load_transactions_etrade_csv(
     account_id:
         Account id to tag the rows with.  Defaults to the virtual
         ``"E*Trade"`` account; pass the real E*Trade statement account id
-        (e.g. ``"913-213128-209"``) when PDFs are loaded alongside so the
+        (e.g. ``"999-999999-999"``) when PDFs are loaded alongside so the
         merge layer dedups overlapping option trades.
 
     Returns

@@ -153,7 +153,7 @@ _SKIP_CONTAINS = ("UNSOLICITED", "INDEX OPTION", "OPENING")
 # ---------------------------------------------------------------------------
 
 def _extract_account_id(all_text: str) -> str:
-    """Extract the E*Trade account number (e.g. '913-213128-209')."""
+    """Extract the E*Trade account number (e.g. '999-999999-999')."""
     m = re.search(r"(\d{3}-\d{6}-\d{3})", all_text)
     return m.group(1) if m else "Unknown"
 

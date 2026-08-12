@@ -23,7 +23,7 @@ from src.io.load_etrade_csv import ETRADE_ACCOUNT_ID
 # Underlyings the strategy is restricted to for E*Trade accounts.
 STRATEGY_UNDERLYINGS = {"SPX", "SPXW"}
 
-# Real E*Trade / Morgan Stanley account ids look like "913-213128-209".
+# Real E*Trade / Morgan Stanley account ids look like "999-999999-999".
 _ETRADE_ACCT_PATTERN = re.compile(r"^\d{3}-\d{6}-\d{3}$")
 
 

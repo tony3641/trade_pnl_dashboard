@@ -8,13 +8,15 @@ import streamlit as st
 
 from src.domain.merge import DEDUP_KEY, merge_transaction_frames
 from src.domain.pnl_engine import build_realized_pnl
-from src.io.load_csv import load_transactions_csv
+from src.domain.strategy_filter import filter_strategy_rows, is_etrade_account
+from src.io.format_detect import load_csv_by_format
 from src.io.load_etrade_pdf import EtradeBalance, load_transactions_etrade_pdf
-from src.io.load_qfx import InvBalance, load_transactions_qfx
+from src.io.load_qfx import InvBalance, load_transactions_qfx, resolve_qfx_account_id
 from src.io.load_spx import load_spx_daily
 from src.io.load_vix import load_vix_daily
 from src.ui.tab_calendar import render_calendar_tab
 from src.ui.tab_curve import render_curve_tab
+from src.ui.tab_return import render_return_tab
 from src.ui.tab_risk import render_risk_tab
 
 
@@ -137,7 +139,7 @@ st.markdown("""
         min-width: 0 !important;
         text-align: center !important;
         margin: 0 !important;
-        max-width: 33.3333% !important;
+        max-width: 25% !important;
     }
 
     /* Tab set row should not wrap across two lines */
@@ -224,7 +226,9 @@ _merge_frames = merge_transaction_frames
 _BalanceInfo = Union[InvBalance, EtradeBalance]
 
 
-def _load_single_file(f) -> tuple[Optional[pd.DataFrame], Optional[_BalanceInfo]]:
+def _load_single_file(
+    f, csv_account_id: str = "E*Trade",
+) -> tuple[Optional[pd.DataFrame], Optional[_BalanceInfo]]:
     """Load one uploaded file (CSV, QFX, or PDF). Returns (df, balance_or_None)."""
     name = getattr(f, "name", "") or ""
     ext = Path(name).suffix.lower()
@@ -240,14 +244,16 @@ def _load_single_file(f) -> tuple[Optional[pd.DataFrame], Optional[_BalanceInfo]
             df, ebal = load_transactions_etrade_pdf(f)
             return df, ebal
         else:
-            df = load_transactions_csv(f)
+            df = load_csv_by_format(f, account_id=csv_account_id)
             return df, None
     except (ValueError, ImportError) as exc:
         st.error(f"{name}: {exc}")
         return None, None
 
 
-def _load_single_path(p: Path) -> tuple[Optional[pd.DataFrame], Optional[_BalanceInfo]]:
+def _load_single_path(
+    p: Path, csv_account_id: str = "E*Trade",
+) -> tuple[Optional[pd.DataFrame], Optional[_BalanceInfo]]:
     """Load a file from a local path (CSV, QFX, or PDF)."""
     ext = p.suffix.lower()
     try:
@@ -258,7 +264,7 @@ def _load_single_path(p: Path) -> tuple[Optional[pd.DataFrame], Optional[_Balanc
             df, ebal = load_transactions_etrade_pdf(p)
             return df, ebal
         else:
-            df = load_transactions_csv(p)
+            df = load_csv_by_format(p, account_id=csv_account_id)
             return df, None
     except (ValueError, ImportError) as exc:
         st.error(f"{p.name}: {exc}")
@@ -266,29 +272,68 @@ def _load_single_path(p: Path) -> tuple[Optional[pd.DataFrame], Optional[_Balanc
 
 
 def _load_input() -> tuple[Optional[pd.DataFrame], list[_BalanceInfo]]:
-    """Load all uploaded files and/or local path, merge, return (df, balances)."""
+    """Load all uploaded files and/or local path, merge, return (df, balances).
+
+    Two-pass loading so an E*Trade trades CSV aligns its account id to a
+    loaded E*Trade PDF statement (their option trades overlap and must dedup):
+    pass 1 loads balance-bearing formats (QFX / PDF) and discovers E*Trade
+    PDF account ids; pass 2 loads CSVs using the resolved account id.
+    """
     frames: list[pd.DataFrame] = []
     balances: list[_BalanceInfo] = []
+    etrade_pdf_accounts: list[str] = []
 
-    # Uploaded files (may be multiple)
-    for f in (uploaded_files or []):
-        df, bal = _load_single_file(f)
-        if df is not None and not df.empty:
-            frames.append(df)
-        if bal is not None:
-            balances.append(bal)
-
-    # Local path
+    # Local path, if provided and exists
+    path_obj: Optional[Path] = None
     if path_input.strip():
         p = Path(path_input.strip())
         if not p.exists():
             st.error("Path does not exist.")
         else:
-            df, bal = _load_single_path(p)
+            path_obj = p
+
+    sources = list(uploaded_files or []) + ([path_obj] if path_obj else [])
+
+    # ---- Pass 1: QFX + PDF (balance-bearing) -------------------------------
+    for src in sources:
+        ext = (
+            src.suffix.lower()
+            if isinstance(src, Path)
+            else Path(getattr(src, "name", "") or "").suffix.lower()
+        )
+        if ext not in (".qfx", ".pdf"):
+            continue
+        df, bal = _load_single_path(src) if isinstance(src, Path) else _load_single_file(src)
+        if df is not None and not df.empty:
+            frames.append(df)
+        if bal is not None:
+            balances.append(bal)
+            if isinstance(bal, EtradeBalance):
+                etrade_pdf_accounts.append(bal.account_id)
+
+    # CSV rows take the E*Trade PDF account id when present so overlapping
+    # option trades dedup; otherwise they form the virtual "E*Trade" account.
+    csv_account_id = etrade_pdf_accounts[0] if etrade_pdf_accounts else "E*Trade"
+
+    # ---- Pass 2: CSVs (format-detected) ------------------------------------
+    for src in sources:
+        ext = (
+            src.suffix.lower()
+            if isinstance(src, Path)
+            else Path(getattr(src, "name", "") or "").suffix.lower()
+        )
+        if ext != ".csv":
+            continue
+        try:
+            if isinstance(src, Path):
+                df, _ = _load_single_path(src, csv_account_id=csv_account_id)
+            else:
+                df, _ = _load_single_file(src, csv_account_id=csv_account_id)
             if df is not None and not df.empty:
                 frames.append(df)
-            if bal is not None:
-                balances.append(bal)
+        except (ValueError, ImportError) as exc:
+            name = getattr(src, "name", "") or str(src)
+            st.error(f"{name}: {exc}")
 
     if not frames:
         return None, []
@@ -349,54 +394,67 @@ if raw_df is None:
     st.stop()
 
 # ---------------------------------------------------------------------------
-# Auto-compute initial capital from all balance sources
+# Per-account capital: balance-derived defaults + user-editable map
 # ---------------------------------------------------------------------------
-# For each account we determine an initial-capital estimate:
-#   • QFX  (InvBalance): Initial = final_balance − sum(net_amounts for that acct)
-#   • E*Trade PDF (EtradeBalance): Initial = beginning_value of the *earliest*
-#     statement for that account.
-# When multiple accounts are loaded the totals are summed.
-_auto_capital: Optional[float] = None
-_capital_parts: dict[str, float] = {}   # account_id → estimated initial capital
+# The per-account capital map is the source of truth for the initial / ending
+# capital used by the Account Return (TWR/MWR) tab.  Balance-bearing files
+# seed it: QFX initial = final_balance − sum(net_amounts for that account);
+# E*Trade PDF initial/ending = earliest beginning_value / latest ending_value.
+# E*Trade CSV-only accounts (no balance) are seeded with a $100k default the
+# user can override in the sidebar.  The shared initial capital used by the
+# Curve / Risk tabs is the sum of the per-account initials.
+_auto_capital_map: dict[str, dict] = {}   # account_id → {initial, ending}
 _sidebar_lines: list[str] = []
 
+# QFX balances: accumulate statement periods per IBKR account.  Each QFX file
+# is one balance snapshot (period_end = <DTASOF>); the latest snapshot anchors
+# the account's ending value and the initial is back-computed
+# (total − Σ that account's net amounts).  Monthly QFX exports chain into a
+# monthly TWR; a single spanning QFX anchors its final month only.
+_qfx_by_acct: dict[str, list[InvBalance]] = {}
 for bal in all_balances:
     if isinstance(bal, InvBalance):
-        # Only subtract the QFX account's net amounts, not all accounts'.
-        # The QFX file doesn't carry an account_id on the balance object,
-        # so we look up which account_id the QFX rows belong to.  When
-        # multiple QFX files are loaded (rare), each InvBalance still
-        # corresponds to the rows from its own file.
-        qfx_accounts = set(
-            raw_df[raw_df["account_id"].str.startswith("U", na=False)]["account_id"].unique()
-        )
-        if qfx_accounts:
-            acct_net = float(
-                raw_df[raw_df["account_id"].isin(qfx_accounts)]["net_amount"]
-                .fillna(0.0).sum()
-            )
-        else:
-            acct_net = float(raw_df["net_amount"].fillna(0.0).sum())
-        cap = bal.total - acct_net
-        key = "__qfx__"
-        _capital_parts[key] = cap
-        _sidebar_lines.append(
-            f"**QFX Account Balance**  \n"
-            f"Cash: `${bal.cash:,.2f}`  \n"
-            f"Stock: `${bal.stock_value:,.2f}`  \n"
-            f"Total: `${bal.total:,.2f}`  \n"
-            f"Est. initial capital: **${cap:,.2f}**"
-        )
+        _qfx_by_acct.setdefault(resolve_qfx_account_id(bal, raw_df), []).append(bal)
 
-# E*Trade PDFs: pick earliest period_start per account
+for acct_id, qfx_list in _qfx_by_acct.items():
+    # Deduplicate by snapshot date (duplicate files / overlapping ranges).
+    unique_bals = {b.as_of: b for b in qfx_list if b.as_of is not None}
+    qfx_list = sorted(unique_bals.values(), key=lambda b: b.as_of)
+    latest = qfx_list[-1]
+    acct_net = float(
+        raw_df[raw_df["account_id"] == acct_id]["net_amount"].fillna(0.0).sum()
+    )
+    cap = latest.total - acct_net
+    _auto_capital_map[acct_id] = {
+        "initial": cap,
+        "ending": latest.total,
+        "periods": [b.to_statement_period() for b in qfx_list],
+    }
+    _sidebar_lines.append(
+        f"**QFX {acct_id}**  \n"
+        f"Cash: `${latest.cash:,.2f}`  \n"
+        f"Stock: `${latest.stock_value:,.2f}`  \n"
+        f"Total: `${latest.total:,.2f}`  \n"
+        f"Est. initial capital: **${cap:,.2f}**"
+    )
+
+# E*Trade PDFs: earliest period_start → initial; latest → ending
 _etrade_by_acct: dict[str, list[EtradeBalance]] = {}
 for bal in all_balances:
     if isinstance(bal, EtradeBalance):
         _etrade_by_acct.setdefault(bal.account_id, []).append(bal)
 
 for acct_id, ebal_list in _etrade_by_acct.items():
-    earliest = min(ebal_list, key=lambda b: b.period_start)
-    _capital_parts[acct_id] = earliest.beginning_value
+    # Deduplicate by period (duplicate files for the same month may be uploaded).
+    unique_bals = {b.period_start: b for b in ebal_list}
+    ebal_list = sorted(unique_bals.values(), key=lambda b: b.period_start)
+    earliest = ebal_list[0]
+    latest = ebal_list[-1]
+    _auto_capital_map[acct_id] = {
+        "initial": earliest.beginning_value,
+        "ending": latest.ending_value,
+        "periods": list(ebal_list),  # statement periods → analysis window for TWR/MWR
+    }
     _sidebar_lines.append(
         f"**E*Trade {acct_id}**  \n"
         f"Cash: `${earliest.cash:,.2f}`  \n"
@@ -404,26 +462,61 @@ for acct_id, ebal_list in _etrade_by_acct.items():
         f"Initial capital: **${earliest.beginning_value:,.2f}**"
     )
 
-if _capital_parts:
-    _auto_capital = sum(_capital_parts.values())
-    with st.sidebar:
-        st.divider()
-        for line in _sidebar_lines:
-            st.markdown(line)
-        if len(_capital_parts) > 1:
-            st.caption(f"Combined initial capital: **${_auto_capital:,.2f}**")
-        else:
-            st.caption(f"Estimated initial capital: **${_auto_capital:,.2f}**")
+# Merge balance-derived defaults into the persisted per-account map without
+# clobbering user edits already stored in session state.
+account_capital: dict[str, dict] = dict(st.session_state.get("account_capital", {}))
+for acct, vals in _auto_capital_map.items():
+    entry = account_capital.setdefault(
+        acct, {"initial": vals["initial"], "ending": vals["ending"],
+               "flows": [], "periods": list(vals.get("periods") or [])}
+    )
+    entry.setdefault("initial", vals["initial"])
+    if entry.get("ending") is None:
+        entry["ending"] = vals["ending"]
+    entry.setdefault("flows", [])
+    entry.setdefault("periods", list(vals.get("periods") or []))
 
-# Always refresh the initial capital when balance info was derived from the
-# currently loaded file(s). Only fall back to the existing session value (or
-# 100 000 as a last resort) when no file supplies balance information.
-if _auto_capital is not None:
-    st.session_state["shared_initial_capital"] = _auto_capital
-    st.session_state["ctx_shared_initial_capital"] = _auto_capital
-elif "shared_initial_capital" not in st.session_state:
-    st.session_state["shared_initial_capital"] = 100000.0
-    st.session_state["ctx_shared_initial_capital"] = 100000.0
+# E*Trade accounts present in the data without balance-derived capital
+# (e.g. the CSV-only virtual account) get a user-editable default.
+for acct in raw_df["account_id"].dropna().unique().tolist():
+    if is_etrade_account(acct) and acct not in _auto_capital_map:
+        account_capital.setdefault(
+            acct, {"initial": 100000.0, "ending": None, "flows": [], "periods": []}
+        )
+
+st.session_state["account_capital"] = account_capital
+
+with st.sidebar:
+    st.divider()
+    for line in _sidebar_lines:
+        st.markdown(line)
+    # E*Trade CSV-only accounts: user sets initial / ending capital here.
+    for acct, vals in account_capital.items():
+        if is_etrade_account(acct) and acct not in _auto_capital_map:
+            init = st.number_input(
+                f"{acct} Initial Capital (USD)",
+                min_value=0.01,
+                value=float(vals.get("initial") or 100000.0),
+                step=1000.0, format="%.2f", key=f"side_init_{acct}",
+            )
+            endv = vals.get("ending")
+            endin = st.number_input(
+                f"{acct} Ending / Current Value (USD)",
+                min_value=0.01,
+                value=float(endv if endv else (vals.get("initial") or 100000.0)),
+                step=1000.0, format="%.2f", key=f"side_end_{acct}",
+            )
+            vals["initial"] = init
+            vals["ending"] = endin
+
+# Shared initial capital = sum of per-account initials (recomputed each rerun).
+_total_initial = sum(float(v.get("initial") or 0.0) for v in account_capital.values())
+if _total_initial <= 0:
+    _total_initial = 100000.0
+st.session_state["shared_initial_capital"] = _total_initial
+st.session_state["ctx_shared_initial_capital"] = _total_initial
+with st.sidebar:
+    st.caption(f"Estimated combined initial capital: **${_total_initial:,.2f}**")
 if "curve_spx_mode" not in st.session_state:
     st.session_state["curve_spx_mode"] = "Off"
 if "curve_range" not in st.session_state:
@@ -448,7 +541,11 @@ if "ctx_shared_window" not in st.session_state:
         st.session_state.get("shared_window", st.session_state.get("ctx_risk_window", "1M"))
     )
 
-result = build_realized_pnl(raw_df)
+# The strategy / PnL views are SPX/SPXW-focused for E*Trade accounts (their
+# CSV also contains stock trades).  The full ledger (raw_df) is retained for
+# the Account Return tab, which treats non-SPX/SPXW activity as external flows.
+strategy_df = filter_strategy_rows(raw_df)
+result = build_realized_pnl(strategy_df)
 rows = result.enriched_rows
 daily = result.daily
 
@@ -461,7 +558,7 @@ if selected_account != "All Accounts":
         .daily
     )
 
-view_options = ["Cumulative PnL", "Daily Calendar", "Risk Measurement"]
+view_options = ["Cumulative PnL", "Daily Calendar", "Risk Measurement", "Account Return"]
 if "active_view" not in st.session_state:
     st.session_state["active_view"] = view_options[0]
 
@@ -486,6 +583,8 @@ if view_label == "Cumulative PnL":
     render_curve_tab(daily, spx_loader=lambda: _load_spx_for_period(daily))
 elif view_label == "Daily Calendar":
     render_calendar_tab(daily)
+elif view_label == "Account Return":
+    render_return_tab(raw_df, account_capital, accounts, selected_account)
 else:
     spx_daily = _load_spx_for_period(daily)
     vix_daily = _load_vix_for_period(daily)

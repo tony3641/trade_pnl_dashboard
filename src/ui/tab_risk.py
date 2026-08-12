@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import timedelta
 
 import numpy as np
@@ -7,6 +8,7 @@ import pandas as pd
 import streamlit as st
 
 from src.domain.risk_metrics import calculate_risk_metrics as _calc_metrics
+from src.ui.capital_util import sync_shared_capital_to_account_map
 
 
 WINDOW_OPTIONS = ["1M", "3M", "YTD", "1Y", "All", "Custom"]
@@ -372,6 +374,7 @@ def render_risk_tab(
     st.session_state["ctx_risk_window"] = range_label
     # ctx_shared_window is already updated automatically via key= on the radio.
     st.session_state["shared_initial_capital"] = float(initial_capital)
+    sync_shared_capital_to_account_map(float(initial_capital))
     st.session_state["risk_annual_rf"] = float(annual_rf_pct)
     st.session_state["risk_window"] = range_label
     st.session_state["shared_window"] = range_label

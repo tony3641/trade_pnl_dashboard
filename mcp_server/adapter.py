@@ -275,6 +275,10 @@ def balance_to_dict(bal: InvBalance | EtradeBalance) -> dict[str, Any]:
     if isinstance(bal, InvBalance):
         return {
             "type": "inv_balance",
+            "account_id": bal.account_id,
+            "as_of": friendly_date(bal.as_of),
+            "dt_start": friendly_date(bal.dt_start),
+            "dt_end": friendly_date(bal.dt_end),
             "cash": serialize_float(bal.cash),
             "stock_value": serialize_float(bal.stock_value),
             "total": serialize_float(bal.total),
@@ -284,6 +288,7 @@ def balance_to_dict(bal: InvBalance | EtradeBalance) -> dict[str, Any]:
             "type": "etrade_balance",
             "account_id": bal.account_id,
             "period_start": friendly_date(bal.period_start),
+            "period_end": friendly_date(bal.period_end),
             "beginning_value": serialize_float(bal.beginning_value),
             "ending_value": serialize_float(bal.ending_value),
             "cash": serialize_float(bal.cash),

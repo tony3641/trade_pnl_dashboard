@@ -16,8 +16,17 @@ streamlit run app.py
 | `.csv` | IB | Perf & Reports -> Transaction History -> CSV |
 | `.qfx` | IB | Perf & Reports -> 3rd Party Reports -> Quicken Web Connect |
 | `.pdf` | E*Trade (Morgan Stanley) | Monthly client statement |
+| `.csv` | E*Trade | "Downloads -> Trades" export; format auto-detected by header |
 
-Upload one or multiple files in the sidebar, or provide a local file path. All sources are merged into a single trade ledger.
+CSV format is auto-detected (IBKR vs E*Trade) by the header row — upload either.
+E*Trade trades CSVs are tagged with a virtual **"E*Trade"** account; when an
+E*Trade monthly PDF statement is loaded alongside, the CSV rows adopt the
+statement's account number so overlapping option trades dedup.
+
+The **strategy / PnL views are SPX/SPXW-only for every account** (E*Trade and
+IBKR alike): non-SPX/SPXW rows — stocks, dividends, fees, non-SPX options —
+stay in the full ledger for the return/reconciliation views but are excluded
+from the equity curve, calendar, and risk tabs.
 
 ### Multi-file Merge Rules
 - Deduplication uses `(activity_date, account_id, symbol, quantity, net_amount)` as key.
@@ -25,7 +34,11 @@ Upload one or multiple files in the sidebar, or provide a local file path. All s
 - Only rows in a later file that duplicate a key from an earlier file are dropped.
 
 ### Initial Capital Auto-Inference
-- **IBKR QFX**: `Final balance − sum(IBKR account net amounts)` using `<INVBAL>`.
+- **IBKR QFX**: `Final balance − sum(that account's net amounts)` using `<INVBAL>`
+  (e.g. $49,928.84 − $7,672.92 = $48,668.98 for the Jan–Jul export). Each QFX file is
+  also one **balance snapshot** (`<DTASOF>` date); monthly QFX exports chain into a
+  monthly TWR, while a single spanning export anchors its final month and estimates
+  the rest from the ledger.
 - **E*Trade PDF**: `Beginning Total Value` from the earliest monthly statement for that account.
 - When multiple accounts are loaded their capitals are summed and shown as "Combined initial capital".
 - The inferred capital pre-fills the input but is always user-overridable.
@@ -54,6 +67,26 @@ Upload one or multiple files in the sidebar, or provide a local file path. All s
 - SPX: correlation, alpha (annualized), beta, SPX period return, return delta vs SPX.
 - Shared global controls: Initial Capital, Window, Risk-Free Rate.
 
+### Account Return Tab (TWR / MWR)
+- Measures the **SPX/SPXW strategy's P&L** against the account's actual capital, for
+  **both E*Trade and IBKR (QFX)** accounts — load them together and the view aggregates
+  them into portfolio-level TWR/MWR.
+- **TWR** (monthly): when monthly statements are loaded (E*Trade PDFs, or one QFX file
+  per month), the monthly capital base is the account's actual value (statement
+  beginning/ending — this includes deposits and every other movement), and the return
+  is `SPX/SPXW PnL ÷ value at month start`. The monthly starting values therefore
+  track the account (e.g. July starts at the June statement's ending value). A single
+  spanning QFX anchors its final month and estimates the rest from the ledger.
+  Without statements it falls back to a ledger-built value.
+- **MWR** = IRR over the account's capital, with deposits/withdrawals and other
+  non-SPX/SPXW movements treated as external cash flows (derived from the
+  statements when loaded; otherwise from the non-SPX/SPXW trades file).
+- Per-account Initial / Ending capital inputs, a monthly TWR breakdown, a
+  full-ledger reconciliation (initial → SPX/SPXW PnL → external flows → ending)
+  whose residual is ~0 when statements and the initial capital align, and a
+  **Combined (All Accounts)** section with portfolio monthly TWR, combined MWR,
+  and a combined monthly breakdown (per-account values summed per month).
+
 ## Sidebar Displays
 
 **IBKR QFX Account Balance**
@@ -75,6 +108,9 @@ Initial capital: $xx,xxx.xx
 
 - `Other Fee` transactions are excluded from realized PnL totals (included in initial capital back-calculation).
 - Stock trades in E*Trade PDFs are intentionally ignored (options-focused account).
+- IBKR QFX **`BUYSTOCK`/`SELLSTOCK`** rows are parsed into the full ledger (e.g. a BIL
+  buy), so the back-computed initial capital is exact. They are non-SPX → excluded from
+  the PnL views but counted as external flows in the return/reconciliation views.
 - SPX data uses Yahoo Finance (`^GSPC`) via `yfinance` — lazy load, 15 s timeout, cached for 6 h.
 - `generate_monthly_report` fetches fresh SPX/VIX from Yahoo Finance **by default** (`offline=False`) and merges it into `reports/data/spx_closes.csv` / `vix_closes.csv`, so the offline fallback always has current benchmark data. Pass `offline=True` to skip the network fetch.
 - Cross-month option positions (opened in one E*Trade statement, closed in another) are handled naturally by the merge layer.
@@ -108,6 +144,7 @@ fastmcp run mcp_server.server
 | `parse_occ_symbol` | Decompose an OCC option symbol into components |
 | `build_occ_symbol` | Assemble a padded OCC option symbol from components |
 | `get_contract_details` | All trades and PnL for a specific option contract |
+| `compute_account_return` | SPX/SPXW-only TWR / MWR with non-SPX activity as external flows; returns a `combined` portfolio block when multiple accounts are loaded |
 | `generate_monthly_report` | Full monthly report — performance + risk + strategy edge analysis (HTML + JSON) |
 
 ### File Input
@@ -158,9 +195,13 @@ src/
     parse_option_symbol.py    # OCC symbol parse + build
     pnl_engine.py             # Realized PnL engine
     risk_metrics.py           # Pure risk-metric computations (shared by UI + MCP)
+    return_metrics.py         # Pure TWR / MWR computations (shared by UI + MCP)
+    strategy_filter.py        # E*Trade account detection + SPX/SPXW strategy filter
     merge.py                  # Cross-file merge + dedup (shared by UI + MCP)
   io/
     load_csv.py               # IB CSV parser
+    load_etrade_csv.py        # E*Trade trades-download CSV parser
+    format_detect.py          # CSV format detection + routing (shared by UI + MCP)
     load_qfx.py               # IBKR QFX/OFX parser
     load_etrade_pdf.py        # E*Trade PDF parser
     load_spx.py               # SPX daily data via yfinance
@@ -169,13 +210,17 @@ src/
     tab_curve.py              # Cumulative PnL tab
     tab_calendar.py           # Daily calendar tab
     tab_risk.py               # Risk measurement tab
+    tab_return.py             # Account Return (TWR/MWR) tab
+    capital_util.py           # Shared initial-capital <-> per-account map sync
 mcp_server/
-    server.py                 # FastMCP app with 9 tools
+    server.py                 # FastMCP app with 10 tools
     adapter.py                # DataFrame → JSON serializers
     requirements.txt
     tests/
         test_adapter.py       # Serializer unit tests
         test_server_tools.py  # Tool integration tests
+        test_etrade_csv.py    # E*Trade CSV / detection / strategy filter / returns
+        test_qfx_return.py    # IBKR QFX TWR/MWR + E*Trade×IBKR portfolio aggregation
 reports/
     generate_report.py        # Monthly HTML report builder (CLI + MCP tool)
     strategy_analysis.py      # Spread reconstruction, edge/tail stats, market data

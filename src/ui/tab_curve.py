@@ -8,6 +8,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+from src.ui.capital_util import sync_shared_capital_to_account_map
+
 
 def _filter_range(df: pd.DataFrame, label: str, custom_start=None, custom_end=None) -> pd.DataFrame:
     if df.empty or label == "All":
@@ -143,6 +145,7 @@ def render_curve_tab(
     st.session_state["ctx_shared_initial_capital"] = float(initial_capital)
     st.session_state["ctx_curve_spx_mode"] = spx_mode
     st.session_state["shared_initial_capital"] = float(initial_capital)
+    sync_shared_capital_to_account_map(float(initial_capital))
     st.session_state["curve_range"] = range_label
     st.session_state["curve_spx_mode"] = spx_mode
     st.session_state["shared_window"] = range_label

@@ -46,6 +46,7 @@ class EtradeBalance:
     ending_value: float         # "Ending Total Value"
     cash: float = 0.0           # Cash allocation from page-3 asset table
     stock_value: float = 0.0    # Equities allocation from page-3 asset table
+    period_end: Optional[date] = None  # "Ending Total Value (as of …)" date
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +185,7 @@ def _extract_balance(all_text: str, account_id: str) -> Optional[EtradeBalance]:
     beginning_value: Optional[float] = None
     ending_value: Optional[float] = None
     period_start: Optional[date] = None
+    period_end: Optional[date] = None
     cash: float = 0.0
     stock_value: float = 0.0
 
@@ -205,6 +207,7 @@ def _extract_balance(all_text: str, account_id: str) -> Optional[EtradeBalance]:
             period_start = dt
         else:
             ending_value = amount
+            period_end = dt
 
     # Extract cash / equity allocation from page-3 asset table
     for line in all_text.split("\n"):
@@ -224,6 +227,7 @@ def _extract_balance(all_text: str, account_id: str) -> Optional[EtradeBalance]:
             ending_value=ending_value or 0.0,
             cash=cash,
             stock_value=stock_value,
+            period_end=period_end,
         )
     return None
 

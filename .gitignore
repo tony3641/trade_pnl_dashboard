@@ -29,3 +29,4 @@ Thumbs.db
 
 # Local tool config
 .mcp.json
+/mcp_server/tests

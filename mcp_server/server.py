@@ -34,10 +34,22 @@ from src.domain.parse_option_symbol import (
     parse_occ_option_symbol,
 )
 from src.domain.pnl_engine import PnlResult, build_realized_pnl
+from src.domain.return_metrics import (
+    compute_mwr,
+    compute_portfolio_mwr,
+    compute_portfolio_twr,
+    compute_strategy_twr,
+    statement_external_flows,
+)
 from src.domain.risk_metrics import calculate_risk_metrics
-from src.io.load_csv import load_transactions_csv
+from src.domain.strategy_filter import (
+    filter_strategy_rows,
+    is_etrade_account,
+    is_strategy_symbol,
+)
+from src.io.format_detect import load_csv_by_format
 from src.io.load_etrade_pdf import EtradeBalance, load_transactions_etrade_pdf
-from src.io.load_qfx import InvBalance, load_transactions_qfx
+from src.io.load_qfx import InvBalance, load_transactions_qfx, resolve_qfx_account_id
 from src.io.load_spx import load_spx_daily
 from src.io.load_vix import load_vix_daily
 from src.ui.tab_calendar import _build_calendar_matrix
@@ -69,7 +81,10 @@ mcp = FastMCP("trade-pnl-dashboard")
 _BalanceInfo = InvBalance | EtradeBalance
 
 
-def _load_file_from_path(path_str: str) -> tuple[pd.DataFrame, _BalanceInfo | None, str | None]:
+def _load_file_from_path(
+    path_str: str,
+    csv_account_id: str = "E*Trade",
+) -> tuple[pd.DataFrame, _BalanceInfo | None, str | None]:
     """Load a single file from a local path. Returns (df, balance, warning)."""
     p = Path(path_str)
     ext = p.suffix.lower()
@@ -81,7 +96,7 @@ def _load_file_from_path(path_str: str) -> tuple[pd.DataFrame, _BalanceInfo | No
             df, bal = load_transactions_etrade_pdf(p)
             return df, bal, None
         else:
-            df = load_transactions_csv(p)
+            df = load_csv_by_format(p, account_id=csv_account_id)
             return df, None, None
     except (ValueError, ImportError, FileNotFoundError, OSError) as exc:
         return pd.DataFrame(), None, f"{p.name}: {exc}"
@@ -90,6 +105,7 @@ def _load_file_from_path(path_str: str) -> tuple[pd.DataFrame, _BalanceInfo | No
 def _load_file_from_bytes(
     name: str,
     data: bytes,
+    csv_account_id: str = "E*Trade",
 ) -> tuple[pd.DataFrame, _BalanceInfo | None, str | None]:
     """Load a single file from in-memory bytes. Returns (df, balance, warning)."""
     ext = Path(name).suffix.lower()
@@ -102,11 +118,25 @@ def _load_file_from_bytes(
             df, bal = load_transactions_etrade_pdf(buf)
             return df, bal, None
         else:
-            # CSV: load_transactions_csv expects a file-like object or path
-            df = load_transactions_csv(buf)
+            df = load_csv_by_format(buf, account_id=csv_account_id)
             return df, None, None
     except (ValueError, ImportError) as exc:
         return pd.DataFrame(), None, f"{name}: {exc}"
+
+
+def _materialize_content(fc: dict[str, str]) -> tuple[str, bytes | None, str | None]:
+    """Return (name, raw_bytes, warning_or_None) for an in-memory file content."""
+    name = fc.get("name", "unknown.csv")
+    data_text = fc.get("data_text")
+    data_b64 = fc.get("data_base64")
+    if data_b64 is not None:
+        try:
+            return name, base64.b64decode(data_b64), None
+        except Exception as exc:
+            return name, None, f"{name}: base64 decode failed ({exc})"
+    if data_text is not None:
+        return name, data_text.encode("utf-8"), None
+    return name, None, f"{name}: neither data_text nor data_base64 provided — skipped"
 
 
 def _load_and_merge(
@@ -115,41 +145,50 @@ def _load_and_merge(
 ) -> tuple[pd.DataFrame, list[_BalanceInfo], list[str]]:
     """Load, merge, and deduplicate transaction files.
 
+    Two-pass loading so an E*Trade trades CSV aligns its account id to a
+    loaded E*Trade PDF statement (their option trades overlap and must dedup):
+    pass 1 loads QFX/PDF (balances + E*Trade PDF account ids); pass 2 loads
+    CSVs using the resolved account id.
+
     Returns ``(merged_df, balances, warnings)``.
     """
+    sources: list[tuple[str, object]] = []
+    for path_str in (paths or []):
+        sources.append(("path", path_str))
+    for fc in (file_contents or []):
+        sources.append(("content", fc))
+
+    def _ext(kind: str, payload) -> str:
+        if kind == "path":
+            return Path(str(payload)).suffix.lower()
+        return Path(str(payload.get("name", "unknown.csv"))).suffix.lower()
+
     frames: list[pd.DataFrame] = []
     balances: list[_BalanceInfo] = []
     warnings: list[str] = []
+    etrade_pdf_accounts: list[str] = []
 
-    # -- Local paths ----------------------------------------------------------
-    for path_str in (paths or []):
-        df, bal, warn = _load_file_from_path(path_str)
+    # ---- Pass 1: QFX + PDF (balance-bearing) --------------------------------
+    for kind, payload in sources:
+        if _ext(kind, payload) not in (".qfx", ".pdf"):
+            continue
+        df, bal, warn = _load_single_source(kind, payload)
         if not df.empty:
             frames.append(df)
         if bal is not None:
             balances.append(bal)
+            if isinstance(bal, EtradeBalance):
+                etrade_pdf_accounts.append(bal.account_id)
         if warn:
             warnings.append(warn)
 
-    # -- In-memory file contents ----------------------------------------------
-    for fc in (file_contents or []):
-        name = fc.get("name", "unknown.csv")
-        data_text = fc.get("data_text")
-        data_b64 = fc.get("data_base64")
+    csv_account_id = etrade_pdf_accounts[0] if etrade_pdf_accounts else "E*Trade"
 
-        if data_b64 is not None:
-            try:
-                raw = base64.b64decode(data_b64)
-            except Exception as exc:
-                warnings.append(f"{name}: base64 decode failed ({exc})")
-                continue
-        elif data_text is not None:
-            raw = data_text.encode("utf-8")
-        else:
-            warnings.append(f"{name}: neither data_text nor data_base64 provided — skipped")
+    # ---- Pass 2: CSVs (format-detected, aligned to E*Trade PDF account) ----
+    for kind, payload in sources:
+        if _ext(kind, payload) != ".csv":
             continue
-
-        df, bal, warn = _load_file_from_bytes(name, raw)
+        df, bal, warn = _load_single_source(kind, payload, csv_account_id=csv_account_id)
         if not df.empty:
             frames.append(df)
         if bal is not None:
@@ -169,6 +208,20 @@ def _load_and_merge(
         merged = merged.sort_values("activity_date").reset_index(drop=True)
 
     return merged, balances, warnings
+
+
+def _load_single_source(
+    kind: str,
+    payload,
+    csv_account_id: str = "E*Trade",
+) -> tuple[pd.DataFrame, _BalanceInfo | None, str | None]:
+    """Load one source (a local path or an in-memory file content)."""
+    if kind == "path":
+        return _load_file_from_path(str(payload), csv_account_id=csv_account_id)
+    name, raw, warn = _materialize_content(payload)
+    if warn:
+        return pd.DataFrame(), None, warn
+    return _load_file_from_bytes(name, raw, csv_account_id=csv_account_id)
 
 
 def _filter_window(
@@ -215,29 +268,33 @@ def _resolve_initial_capital(
     merged_df: pd.DataFrame,
     provided: float | None,
 ) -> float:
-    """Resolve initial capital: use provided value, or auto-infer from balances."""
+    """Resolve initial capital: use provided value, or auto-infer from balances.
+
+    For QFX balances the latest snapshot per account (by ``<DTASOF>``) anchors
+    ``total − Σ that account's net amounts``; E*Trade PDFs use the earliest
+    statement's beginning value.
+    """
     if provided is not None:
         return float(provided)
 
     capital_parts: dict[str, float] = {}
+    qfx_latest: dict[str, InvBalance] = {}
 
     for bal in balances:
         if isinstance(bal, InvBalance):
-            qfx_accounts = set(
-                merged_df[merged_df["account_id"].str.startswith("U", na=False)]["account_id"].unique()
-            )
-            if qfx_accounts:
-                acct_net = float(
-                    merged_df[merged_df["account_id"].isin(qfx_accounts)]["net_amount"]
-                    .fillna(0.0).sum()
-                )
-            else:
-                acct_net = float(merged_df["net_amount"].fillna(0.0).sum())
-            capital_parts["__qfx__"] = bal.total - acct_net
+            acct = resolve_qfx_account_id(bal, merged_df)
+            if acct not in qfx_latest or (
+                bal.as_of and (qfx_latest[acct].as_of is None or bal.as_of > qfx_latest[acct].as_of)
+            ):
+                qfx_latest[acct] = bal
         elif isinstance(bal, EtradeBalance):
-            existing = capital_parts.get(bal.account_id)
-            if existing is None:
-                capital_parts[bal.account_id] = bal.beginning_value
+            capital_parts.setdefault(bal.account_id, bal.beginning_value)
+
+    for acct, bal in qfx_latest.items():
+        acct_net = float(
+            merged_df[merged_df["account_id"] == acct]["net_amount"].fillna(0.0).sum()
+        )
+        capital_parts[acct] = float(bal.total - acct_net)
 
     if capital_parts:
         return sum(capital_parts.values())
@@ -395,6 +452,9 @@ def compute_daily_pnl(
     if merged.empty:
         return {"error": "No transaction data found in provided files.", "warnings": warnings}
 
+    # Strategy views are SPX/SPXW-focused for E*Trade accounts.
+    merged = filter_strategy_rows(merged)
+
     capital = _resolve_initial_capital(balances, merged, initial_capital)
 
     # Account filtering
@@ -446,6 +506,9 @@ def get_contract_details(
 
     if merged.empty:
         return {"error": "No transaction data found.", "warnings": warnings}
+
+    # Strategy views are SPX/SPXW-focused for E*Trade accounts.
+    merged = filter_strategy_rows(merged)
 
     if account_filter != "All" and account_filter in merged["account_id"].values:
         merged = merged[merged["account_id"] == account_filter]
@@ -582,6 +645,9 @@ def get_calendar_data(
     if merged.empty:
         return {"error": "No transaction data found.", "warnings": warnings}
 
+    # Strategy views are SPX/SPXW-focused for E*Trade accounts.
+    merged = filter_strategy_rows(merged)
+
     result = build_realized_pnl(merged)
     daily = result.daily
 
@@ -650,6 +716,9 @@ def compute_risk_metrics(
     if merged.empty:
         return {"error": "No transaction data found.", "warnings": warnings}
 
+    # Strategy views are SPX/SPXW-focused for E*Trade accounts.
+    merged = filter_strategy_rows(merged)
+
     capital = _resolve_initial_capital(balances, merged, initial_capital)
 
     if account_filter != "All" and account_filter in merged["account_id"].values:
@@ -709,6 +778,242 @@ def compute_risk_metrics(
         **metrics_to_dict(metrics),
         "warnings": warnings,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tool: compute_account_return (SPX/SPXW-only TWR / MWR)
+# ---------------------------------------------------------------------------
+
+def _build_account_capital(
+    merged: pd.DataFrame,
+    balances: list[_BalanceInfo],
+) -> dict[str, dict]:
+    """Per-account capital map seeded from balance data (mirrors app.py).
+
+    QFX balances accumulate statement periods per IBKR account — each file is
+    one balance snapshot (period_end = ``<DTASOF>``); the latest snapshot
+    anchors ``ending = total`` and ``initial = total − Σ that account's net``.
+    E*Trade PDF periods keep their statement beginning value as the initial.
+    """
+    cap: dict[str, dict] = {}
+    qfx_latest: dict[str, InvBalance] = {}
+
+    for bal in balances:
+        if isinstance(bal, InvBalance):
+            acct = resolve_qfx_account_id(bal, merged)
+            entry = cap.setdefault(acct, {"initial": None, "ending": None, "periods": []})
+            entry["periods"].append(bal.to_statement_period())
+            if acct not in qfx_latest or (
+                bal.as_of and (qfx_latest[acct].as_of is None or bal.as_of > qfx_latest[acct].as_of)
+            ):
+                qfx_latest[acct] = bal
+        elif isinstance(bal, EtradeBalance):
+            entry = cap.setdefault(
+                bal.account_id, {"initial": None, "ending": None, "periods": []}
+            )
+            entry["periods"].append(bal)
+
+    for acct, bal in qfx_latest.items():
+        acct_net = float(
+            merged[merged["account_id"] == acct]["net_amount"].fillna(0.0).sum()
+        )
+        cap[acct]["initial"] = float(bal.total - acct_net)
+        cap[acct]["ending"] = float(bal.total)
+
+    for acct in merged["account_id"].dropna().unique().tolist():
+        if is_etrade_account(acct) and acct not in cap:
+            cap[acct] = {"initial": 100000.0, "ending": None, "periods": []}
+
+    for entry in cap.values():
+        # Deduplicate by period (duplicate files for the same month may be passed).
+        periods = sorted(
+            {b.period_start: b for b in entry["periods"]}.values(),
+            key=lambda b: b.period_start,
+        )
+        if periods:
+            # E*Trade periods carry a real beginning value → their initial.
+            # QFX periods have a 0.0 placeholder and their initial/ending were
+            # set above from the latest snapshot.
+            first_begin = getattr(periods[0], "beginning_value", None)
+            if first_begin and first_begin > 0:
+                entry["initial"] = first_begin
+            if entry.get("ending") is None:
+                entry["ending"] = periods[-1].ending_value
+        else:
+            entry.setdefault("initial", 100000.0)
+            entry.setdefault("ending", None)
+        entry["periods"] = periods
+    return cap
+
+
+def _period_range(acct_df: pd.DataFrame, periods: list) -> tuple[date, date]:
+    """Analysis window: merge statement-period bounds with the ledger activity range."""
+    lo = acct_df["activity_date"].min() if not acct_df.empty else None
+    hi = acct_df["activity_date"].max() if not acct_df.empty else None
+    for p in periods:
+        ps = getattr(p, "period_start", None)
+        pe = getattr(p, "period_end", None)
+        if ps is not None:
+            lo = ps if lo is None else min(lo, ps)
+        end = pe or (ps + timedelta(days=30) if ps is not None else None)
+        if end is not None:
+            hi = end if hi is None else max(hi, end)
+    if lo is not None and hi is not None:
+        return lo, hi
+    return date.today() - timedelta(days=30), date.today()
+
+
+@mcp.tool()
+def compute_account_return(
+    paths: list[str] | None = None,
+    file_contents: list[dict[str, str]] | None = None,
+    account_filter: str = "All",
+    method: str = "Both",
+    initial_capital: float | None = None,
+    ending_capital: float | None = None,
+    cash_flows: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Compute SPX/SPXW-only time-weighted (TWR) and money-weighted (MWR) returns.
+
+    The SPX/SPXW strategy is the only return driver; every non-SPX/SPXW
+    transaction (stock trades, dividends, deposits/withdrawals, non-SPX
+    options) is treated as an external cash flow to/from the strategy.
+
+    Args:
+        paths / file_contents: Transaction sources (CSV, QFX, or PDF).
+        account_filter: "All" or a specific account id.
+        method: "TWR", "MWR", or "Both".
+        initial_capital / ending_capital: Optional overrides.  Defaults are
+            inferred from balance data (E*Trade PDF beginning/ending values,
+            QFX INVBAL).
+        cash_flows: Optional extra external flows as ``[{"date": "YYYY-MM-DD",
+            "amount": float}]`` where positive = deposit into the account,
+            negative = withdrawal.
+
+    Returns:
+        Dict with per-account ``twr`` / ``mwr`` results and warnings.
+    """
+    try:
+        merged, balances, warnings = _load_and_merge(paths, file_contents)
+    except Exception as exc:
+        return {"error": str(exc), "traceback": traceback.format_exc()}
+
+    if merged.empty:
+        return {"error": "No transaction data found.", "warnings": warnings}
+
+    account_capital = _build_account_capital(merged, balances)
+
+    accounts = sorted(merged["account_id"].dropna().unique().tolist())
+    targets = [account_filter] if account_filter != "All" and account_filter in accounts else accounts
+
+    parsed_flows: list[tuple[date, float]] = []
+    for cf in (cash_flows or []):
+        d, amt = cf.get("date"), cf.get("amount")
+        if d and amt is not None:
+            try:
+                parsed_flows.append((datetime.strptime(d, "%Y-%m-%d").date(), float(amt)))
+            except ValueError:
+                warnings.append(f"Ignoring cash flow with invalid date: {d!r}")
+
+    results: list[dict[str, Any]] = []
+    portfolio_accounts: list[dict[str, Any]] = []
+    for acct in targets:
+        cap = account_capital.setdefault(
+            acct, {"initial": initial_capital or 100000.0, "ending": ending_capital, "periods": []}
+        )
+        if initial_capital is not None:
+            cap["initial"] = initial_capital
+        if ending_capital is not None:
+            cap["ending"] = ending_capital
+
+        acct_df_all = merged[merged["account_id"] == acct]
+        start, end = _period_range(acct_df_all, cap.get("periods") or [])
+        if not acct_df_all.empty:
+            acct_df = acct_df_all[
+                (acct_df_all["activity_date"] >= start) & (acct_df_all["activity_date"] <= end)
+            ]
+        else:
+            acct_df = acct_df_all
+
+        strat_mask = acct_df["symbol"].map(is_strategy_symbol).fillna(False)
+        strategy_df = acct_df[strat_mask]
+        flow_df = acct_df[~strat_mask]
+        spx_pnl = [(r["activity_date"], r["net_amount"]) for _, r in strategy_df.iterrows()]
+        ext_flows = [(r["activity_date"], r["net_amount"]) for _, r in flow_df.iterrows()]
+
+        entry: dict[str, Any] = {
+            "account": acct,
+            "initial_capital": cap["initial"],
+            "ending_capital": cap["ending"],
+            "start": friendly_date(start),
+            "end": friendly_date(end),
+            "strategy_trades": int(len(strategy_df)),
+            "external_flow_rows": int(len(flow_df)),
+        }
+        # Statement-derived external flows (incl. deposits) when statements are
+        # loaded — this makes the strategy value track the account.
+        periods = cap.get("periods") or []
+        derived_flows = (
+            statement_external_flows(cap["initial"], spx_pnl, periods) if periods else []
+        )
+        strategy_pnl = float(strategy_df["net_amount"].sum()) if not strategy_df.empty else 0.0
+        ext_flows_total = (
+            sum(a for _, a in derived_flows)
+            if periods
+            else (float(flow_df["net_amount"].sum()) if not flow_df.empty else 0.0)
+        )
+        strategy_ending = cap["initial"] + strategy_pnl + ext_flows_total
+        entry["strategy_ending"] = strategy_ending
+        entry["statement_periods"] = len(periods)
+        if method in ("Both", "TWR"):
+            entry["twr"] = _safe_value(
+                compute_strategy_twr(
+                    cap["initial"], spx_pnl, ext_flows, statement_periods=periods or None
+                )
+            )
+        if method in ("Both", "MWR"):
+            if periods:
+                mwr = compute_mwr(
+                    cap["initial"], cap["ending"], start, end,
+                    cash_flows=derived_flows + parsed_flows,
+                )
+            else:
+                mwr = compute_mwr(
+                    cap["initial"], strategy_ending, start, end,
+                    cash_flows=ext_flows + parsed_flows,
+                )
+            entry["mwr"] = _safe_value(mwr)
+        portfolio_accounts.append({
+            "initial": cap["initial"],
+            "ending": cap["ending"] if cap["ending"] is not None else strategy_ending,
+            "spx_pnl_by_date": spx_pnl,
+            "external_flows_by_date": ext_flows,
+            "statement_periods": periods,
+            "mwr_flows": (derived_flows + parsed_flows) if periods else (ext_flows + parsed_flows),
+        })
+        results.append(entry)
+
+    result: dict[str, Any] = {"method": method, "accounts": results, "warnings": warnings}
+    if account_filter == "All" and len(targets) > 1:
+        combined: dict[str, Any] = {}
+        if method in ("Both", "TWR"):
+            combined["twr"] = _safe_value(compute_portfolio_twr(portfolio_accounts))
+        if method in ("Both", "MWR"):
+            all_periods = [p for a in portfolio_accounts for p in (a["statement_periods"] or [])]
+            c_start, c_end = _period_range(merged, all_periods)
+            combined["mwr"] = _safe_value(
+                compute_portfolio_mwr(portfolio_accounts, c_start, c_end)
+            )
+            combined["start"] = friendly_date(c_start)
+            combined["end"] = friendly_date(c_end)
+        combined["initial_capital"] = serialize_float(
+            sum(float(a["initial"] or 0.0) for a in portfolio_accounts)
+        )
+        combined["ending_capital"] = serialize_float(
+            sum(float(a["ending"] or 0.0) for a in portfolio_accounts)
+        )
+        result["combined"] = combined
+    return result
 
 
 # ---------------------------------------------------------------------------

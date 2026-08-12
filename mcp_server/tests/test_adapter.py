@@ -284,12 +284,20 @@ class TestParsedOptionToDict:
 
 class TestBalanceToDict:
     def test_inv_balance(self):
-        bal = InvBalance(cash=5601.49, stock_value=39379.40)
+        bal = InvBalance(
+            cash=5601.49, stock_value=39379.40,
+            account_id="U10401338", as_of=date(2026, 7, 27),
+            dt_start=date(2025, 12, 31), dt_end=date(2026, 7, 27),
+        )
         d = balance_to_dict(bal)
         assert d["type"] == "inv_balance"
         assert d["cash"] == 5601.49
         assert d["stock_value"] == 39379.40
         assert d["total"] == 44980.89
+        assert d["account_id"] == "U10401338"
+        assert d["as_of"] == "2026-07-27"
+        assert d["dt_start"] == "2025-12-31"
+        assert d["dt_end"] == "2026-07-27"
 
     def test_etrade_balance(self):
         bal = EtradeBalance(
